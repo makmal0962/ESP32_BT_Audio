@@ -3,6 +3,7 @@
 #include <LittleFS.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include "AudioTools/AudioCodecs/CodecMP3Helix.h"
 
 #define LED_PIN         2
 #define DEVICE_NAME     "ESP32 BT Audio"
@@ -45,20 +46,15 @@ struct TrackInfo {
 TrackInfo track = {};
 
 // --- Chime ---
-void play_chime_direct(const char *path) {
+void play_chime_mp3(const char *path) {
     File f = LittleFS.open(path, "r");
     if (!f) return;
-    f.seek(44);
-    int16_t mono[256], stereo[512];
-    while (f.available()) {
-        size_t n = f.read((uint8_t *)mono, sizeof(mono));
-        int samples = n / 2;
-        for (int i = 0; i < samples; i++) {
-            stereo[i*2]   = mono[i];
-            stereo[i*2+1] = mono[i];
-        }
-        i2s.write((uint8_t *)stereo, samples * 4);
-    }
+    MP3DecoderHelix mp3decoder;
+    EncodedAudioStream decoder(&i2s, &mp3decoder);
+    StreamCopy copier(decoder, f);
+    decoder.begin();
+    while (f.available()) copier.copy();
+    decoder.end();
     f.close();
 }
 
@@ -68,7 +64,7 @@ void chime_task(void *param) {
         if (xQueueReceive(chime_queue, &path, portMAX_DELAY)) {
             chime_blocking = true;
             delay(300);
-            play_chime_direct(path);
+            play_chime_mp3(path);
             chime_blocking = false;
         }
     }
@@ -80,6 +76,11 @@ void enqueue_chime(const char *path) {
 
 // --- A2DP stream ---
 void read_data_stream(const uint8_t *data, uint32_t len) {
+    static uint32_t last_log = 0;
+    if (millis() - last_log > 2000) {
+        Serial.printf("Stream data: %u bytes\n", len);
+        last_log = millis();
+    }
     if (chime_blocking) return;
     i2s.write(data, len);
 }
@@ -102,6 +103,7 @@ void avrc_metadata_callback(uint8_t id, const uint8_t *text) {
 }
 
 void avrc_playstatus_callback(esp_avrc_playback_stat_t playback) {
+    Serial.printf("Playback state: %d\n", playback);
     xSemaphoreTake(track_mutex, portMAX_DELAY);
     track.playing = (playback == ESP_AVRC_PLAYBACK_PLAYING);
     xSemaphoreGive(track_mutex);
@@ -228,17 +230,24 @@ void display_task(void *param) {
 }
 
 void handle_buttons() {
-    if (millis() - last_btn_ms < DEBOUNCE_MS) return;
-    if (!digitalRead(BTN_PLAY)) {
-        last_btn_ms = millis();
-        track.playing ? a2dp_sink.pause() : a2dp_sink.play();
-    } else if (!digitalRead(BTN_PREV)) {
-        last_btn_ms = millis();
-        a2dp_sink.previous();
-    } else if (!digitalRead(BTN_NEXT)) {
-        last_btn_ms = millis();
-        a2dp_sink.next();
+    static uint32_t play_press_ms = 0;
+    static bool     play_held     = false;
+    uint32_t now = millis();
+
+    bool play_btn = !digitalRead(BTN_PLAY);
+    if (play_btn && !play_held) {
+        play_press_ms = now;
+        play_held     = true;
+    } else if (!play_btn && play_held) {
+        play_held = false;
+        uint32_t held = now - play_press_ms;
+        if (held >= 3000)        a2dp_sink.disconnect();
+        else if (held >= DEBOUNCE_MS) track.playing ? a2dp_sink.pause() : a2dp_sink.play();
     }
+
+    if (now - last_btn_ms < DEBOUNCE_MS) return;
+    if (!digitalRead(BTN_PREV))      { last_btn_ms = now; a2dp_sink.previous(); }
+    else if (!digitalRead(BTN_NEXT)) { last_btn_ms = now; a2dp_sink.next(); }
 }
 
 // --- Setup ---
@@ -262,7 +271,7 @@ void setup() {
     cfg.pin_data = 19;
     i2s.begin(cfg);
 
-    play_chime_direct("/on.wav");
+    enqueue_chime("/on.mp3");
 
     a2dp_sink.set_stream_reader(read_data_stream, false);
     a2dp_sink.set_on_connection_state_changed(bt_connection_changed);
@@ -274,6 +283,8 @@ void setup() {
     a2dp_sink.set_avrc_rn_playstatus_callback(avrc_playstatus_callback);
     a2dp_sink.set_avrc_rn_play_pos_callback(avrc_position_callback, 1); // 1s interval
     a2dp_sink.set_auto_reconnect(true);
+    i2s_config_t cfg_i2s = {};
+    a2dp_sink.set_bits_per_sample(16);
     a2dp_sink.start(DEVICE_NAME);
 }
 
@@ -281,7 +292,7 @@ void loop() {
     handle_buttons();
     if (connect_chime_pending) {
         connect_chime_pending = false;
-        enqueue_chime("/connect.wav");
+        enqueue_chime("/connect.mp3");
 
         delay(500); // let AVRC settle
         const char *pname = a2dp_sink.get_peer_name();
@@ -295,7 +306,7 @@ void loop() {
     if (!bt_connected) {
         if (disconnect_chime_pending) {
             disconnect_chime_pending = false;
-            enqueue_chime("/disconnect.wav");
+            enqueue_chime("/disconnect.mp3");
         }
         digitalWrite(LED_PIN, HIGH);
         delay(500);
