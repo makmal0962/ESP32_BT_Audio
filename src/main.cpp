@@ -22,11 +22,12 @@ I2SStream i2s;
 BluetoothA2DPSink a2dp_sink(i2s);
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 
-volatile bool bt_connected             = false;
-volatile bool connect_chime_pending    = false;
-volatile bool disconnect_chime_pending = false;
-volatile bool chime_blocking           = false;
-volatile bool bt_ready = false;
+volatile bool bt_connected      = false;
+volatile bool chime_blocking    = false;
+volatile bool connect_event     = false;
+volatile bool disconnect_event  = false;
+volatile bool bt_ready          = false;
+volatile uint8_t avrcp_volume   = 127;
 
 QueueHandle_t    chime_queue;
 SemaphoreHandle_t track_mutex;
@@ -60,6 +61,7 @@ GifAnim gif = {};
 
 #define FFT_SAMPLES   1024
 #define AUDIO_BUF_LEN FFT_SAMPLES * 2
+#define WAVE_ZOOM 0.25f // <1.0 = zoom in (more detail), >1.0 = zoom out
 
 enum ScreenMode { SCREEN_MAIN, SCREEN_FFT, SCREEN_WAVE };
 volatile ScreenMode screen_mode = SCREEN_MAIN;
@@ -77,11 +79,9 @@ int binToBar[NYQUIST_BINS];          // bar index for each FFT bin (1..NYQUIST_B
 const float SAMPLE_RATE = 44100.0;
 const int NUM_BARS = 16;
 
-float fft_peak = 1.0;
 int barHeight[NUM_BARS]     = {0}; // smoothed bar heights
 int barPeakHold[NUM_BARS]   = {0}; // peak hold per bar
 uint32_t barPeakMs[NUM_BARS]  = {0};    // timestamp of peak hold
-float waveform_peak = 1.0;
 
 volatile bool audio_started = false;
 
@@ -125,8 +125,8 @@ void play_chime_mp3(const char *path) {
 void chime_task(void *param) {
     const char *path;
     for (;;) {
+        while (!bt_ready) vTaskDelay(10);
         if (xQueueReceive(chime_queue, &path, portMAX_DELAY)) {
-            while (!bt_ready) vTaskDelay(10);
             chime_blocking = true;
             // delay(300);
             play_chime_mp3(path);
@@ -142,19 +142,25 @@ void enqueue_chime(const char *path) {
 // --- A2DP stream ---
 void read_data_stream(const uint8_t *data, uint32_t len) {
     if (chime_blocking) return;
-    i2s.write(data, len);
     audio_started = true;
-    // mix stereo to mono into ring buffer
+
     int16_t *samples = (int16_t *)data;
-    int count = len / 4; // stereo 16-bit = 4 bytes/frame
-    if (xSemaphoreTake(audio_mutex, 0)) { // non-blocking, skip if busy
+    int count = len / 4;
+
+    if (xSemaphoreTake(audio_mutex, 0)) {
         for (int i = 0; i < count; i++) {
             audio_ring[audio_ring_pos % AUDIO_BUF_LEN] =
-                (samples[i*2] / 2) + (samples[i*2+1] / 2); // L+R mix
+                (samples[i*2] / 2) + (samples[i*2+1] / 2);
             audio_ring_pos++;
         }
         xSemaphoreGive(audio_mutex);
     }
+
+    float scale = avrcp_volume / 127.0f;
+    static int16_t out[1024 * 2];
+    for (int i = 0; i < count * 2; i++)
+        out[i] = (int16_t)(samples[i] * scale);
+    i2s.write((uint8_t *)out, count * 2 * sizeof(int16_t));
 }
 
 // --- AVRCP callbacks ---
@@ -194,12 +200,22 @@ void avrc_position_callback(uint32_t pos_ms) {
     xSemaphoreGive(track_mutex);
 }
 
+void avrc_volume_callback(int vol) {
+    avrcp_volume = (uint8_t)vol;
+}
+
 void bt_connection_changed(esp_a2d_connection_state_t state, void *ptr) {
+    bool was_connected = bt_connected;
     bt_connected = (state == ESP_A2D_CONNECTION_STATE_CONNECTED);
     if (bt_connected) {
         digitalWrite(LED_PIN, HIGH);
-        connect_chime_pending = true;
-    } else {
+        xSemaphoreTake(track_mutex, portMAX_DELAY);
+        strncpy(track.peer_name, "...", 63);
+        track.show_peer  = true;
+        track.peer_until = millis() + PEER_SHOW_MS + 2000;
+        xSemaphoreGive(track_mutex);
+        connect_event = true;
+    } else if (was_connected) {
         xSemaphoreTake(track_mutex, portMAX_DELAY);
         memset(track.title,  0, sizeof(track.title));
         memset(track.artist, 0, sizeof(track.artist));
@@ -207,7 +223,50 @@ void bt_connection_changed(esp_a2d_connection_state_t state, void *ptr) {
         track.duration_ms = track.position_ms = 0;
         track.playing     = false;
         xSemaphoreGive(track_mutex);
-        disconnect_chime_pending = true;
+        disconnect_event = true;
+    }
+}
+
+void bt_event_task(void *param) {
+    for (;;) {
+        while (!bt_ready) vTaskDelay(10);
+        if (connect_event) {
+            connect_event = false;
+            enqueue_chime("/connect.mp3");
+
+            uint32_t timeout = millis() + 2000;
+            const char *pname = nullptr;
+            do {
+                vTaskDelay(10);
+                pname = a2dp_sink.get_peer_name();
+            } while ((!pname || pname[0] == '\0') && millis() < timeout);
+
+            xSemaphoreTake(track_mutex, portMAX_DELAY);
+            strncpy(track.peer_name, (pname && pname[0]) ? pname : "Unknown Device", 63);
+            track.peer_until = millis() + PEER_SHOW_MS;
+            xSemaphoreGive(track_mutex);
+        }
+
+        if (disconnect_event) {
+            disconnect_event = false;
+            enqueue_chime("/disconnect.mp3");
+        }
+
+        vTaskDelay(5);
+    }
+}
+
+void led_task(void *param) {
+    for (;;) {
+        while (!bt_ready) vTaskDelay(10);
+        if (!bt_connected) {
+            digitalWrite(LED_PIN, HIGH);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            if (!bt_connected) digitalWrite(LED_PIN, LOW);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
     }
 }
 
@@ -290,23 +349,26 @@ void draw_fft() {
     }
 
     // peak detection with decay
-    float current_peak = DB_FLOOR;
-    for (int b = 0; b < NUM_BARS; b++)
-    if (barMag[b] > current_peak) current_peak = barMag[b];
+    // float current_peak = DB_FLOOR;
+    // for (int b = 0; b < NUM_BARS; b++)
+    // if (barMag[b] > current_peak) current_peak = barMag[b];
 
-    // Decay factor – adjust to taste (0.995 = fairly slow release, 0.98 = faster release)
-    const float PEAK_DECAY = 0.998f;
+    // // Decay factor – adjust to taste (0.995 = fairly slow release, 0.98 = faster release)
+    // const float PEAK_DECAY = 0.9997f;
 
-    // Update the running peak
-    // fft_peak = max(current_peak, fft_peak * PEAK_DECAY);
-    fft_peak = current_peak > (fft_peak * PEAK_DECAY) ? current_peak : (fft_peak * PEAK_DECAY);
-    if (fft_peak < DB_FLOOR) fft_peak = DB_FLOOR;
+    // // Update the running peak
+    // // fft_peak = max(current_peak, fft_peak * PEAK_DECAY);
+    // fft_peak = current_peak > (fft_peak * PEAK_DECAY) ? current_peak : (fft_peak * PEAK_DECAY);
+    // if (fft_peak < DB_FLOOR) fft_peak = DB_FLOOR;
+
+    // fixed reference
+    const float FFT_REF = 32768.0f * FFT_SAMPLES / 4.0f;
 
     uint32_t now_ms = millis();
 
-    const int BAR_DECAY           = 3; // bar fall
+    const int BAR_DECAY           = 3; // px/frame
     const uint32_t PEAK_BAR_HOLD_MS    = 800;
-    const int PEAK_BAR_DECAY      = 1; // peak dot fall after hold
+    const int PEAK_BAR_DECAY      = 1; // px/frame
 
     const int BAR_AREA  = 54;
     const int BAR_WIDTH = 128 / NUM_BARS;
@@ -319,8 +381,16 @@ void draw_fft() {
     // }
 
     for (int b = 0; b < NUM_BARS; b++) {
-        float normalized = (barMag[b] + DB_FLOOR) / (fft_peak + DB_FLOOR);
-        int target = constrain((int)(normalized * BAR_AREA), 0, BAR_AREA);
+        // float normalized = 0.0f;
+        // float peak_range = fft_peak + DB_FLOOR;
+        // if (peak_range > 1.0f) 
+        //     normalized = (barMag[b] + DB_FLOOR) / peak_range;
+
+        float db = barMag[b] > 0 ? 10.0f * log10f(barMag[b] / FFT_REF) : DB_FLOOR;
+        db = db < DB_FLOOR ? DB_FLOOR : db;
+        float normalized = (db - DB_FLOOR) / (0.0f - DB_FLOOR); // 0dBFS = full bar
+        normalized = normalized < 0.0f ? 0.0f : (normalized > 1.0f ? 1.0f : normalized);
+        int target = (int)(normalized * BAR_AREA);
 
         // rise instantly, decay time-based
         if (target > barHeight[b])
@@ -329,6 +399,10 @@ void draw_fft() {
             barHeight[b] -= BAR_DECAY;
         if (barHeight[b] < 0) barHeight[b] = 0;
 
+        // if (b == 0) {
+        //     Serial.printf("normalized[0]: %.2f\n", normalized);
+        //     Serial.printf("BarHeight[0]: %d\n", barHeight[0]);
+        // }
         // peak hold dot
         if (target >= barPeakHold[b]) {
             barPeakHold[b] = target;
@@ -338,9 +412,9 @@ void draw_fft() {
             if (barPeakHold[b] < 0) barPeakHold[b] = 0;
         }
 
-        int h    = constrain((int)barHeight[b],   0, BAR_AREA);
+        int h    = constrain(barHeight[b],   0, BAR_AREA);
         // int h = constrain((int)(normalized * BAR_AREA), 0, BAR_AREA);
-        int peak = constrain((int)barPeakHold[b], 0, BAR_AREA);
+        int peak = constrain(barPeakHold[b], 0, BAR_AREA);
 
         if (h > 0)    u8g2.drawBox(START_X + b * BAR_WIDTH, 63 - h, BAR_WIDTH - 1, h);
         if (peak > h) u8g2.drawHLine(START_X + b * BAR_WIDTH, 63 - peak, BAR_WIDTH - 1);
@@ -348,39 +422,23 @@ void draw_fft() {
 }
 
 void draw_waveform() {
+    float snapshot[128];
     xSemaphoreTake(audio_mutex, portMAX_DELAY);
     uint32_t start = audio_ring_pos;
-    int16_t buf[128];
-    int step = AUDIO_BUF_LEN / 128;
+    int step = (int)((AUDIO_BUF_LEN / 128) * WAVE_ZOOM);
+    if (step < 1) step = 1;
     for (int i = 0; i < 128; i++)
-        buf[i] = audio_ring[(start + i * step) % AUDIO_BUF_LEN];
+        snapshot[i] = audio_ring[(start + i * step) % AUDIO_BUF_LEN];
     xSemaphoreGive(audio_mutex);
 
-    const int TOP    = 9;  // below "WAVE" label
+    const int TOP    = 9;
     const int BOTTOM = 63;
-    const int MID    = (TOP + BOTTOM) / 2; // ~36
-    const int HALF   = (BOTTOM - TOP) / 2; // ~27
+    const int MID    = (TOP + BOTTOM) / 2;
+    const int HALF   = (BOTTOM - TOP) / 2;
+    const float REF  = 32768.0f; // fixed full-scale reference
 
-    // find peak for auto-scale
-    float current_peak = 0;
-    for (int i = 0; i < 128; i++) {
-        float abs_val = abs(buf[i]);
-        if (abs_val > current_peak) current_peak = abs_val;
-    }
-
-    // Decay factor – adjust to taste (0.95 = faster, 0.98 = slower)
-    const float PEAK_DECAY = 0.998f;
-    const float MIN_PEAK = 1.0f;  // prevent division by zero / too sensitive
-
-    // Update the running peak with decay
-    waveform_peak = max(current_peak, waveform_peak * PEAK_DECAY);
-    if (waveform_peak < MIN_PEAK) waveform_peak = MIN_PEAK;
-
-    // Serial.printf("Wave peak: %.2f\n", waveform_peak);
-    
-    // u8g2.drawHLine(0, MID, 128); // center line
     for (int x = 0; x < 128; x++) {
-        int y = MID - (buf[x] * HALF / (int)waveform_peak);
+        int y = MID - (int)(snapshot[x] / REF * HALF);
         y = constrain(y, TOP, BOTTOM);
         u8g2.drawPixel(x, y);
     }
@@ -422,7 +480,7 @@ void display_task(void *param) {
 
             if (t.show_peer && now < t.peer_until) {
                 // Connected — briefly show peer name
-                u8g2.setFont(u8g2_font_unifont_t_gb2312);
+                u8g2.setFont(u8g2_font_unifont_t_japanese3);
                 int lw = u8g2.getUTF8Width("Connected to:");
                 u8g2.drawUTF8((128 - lw) / 2, 24, "Connected to:");
                 int pw = u8g2.getUTF8Width(t.peer_name);
@@ -437,7 +495,7 @@ void display_task(void *param) {
                 // Main screen
                 // layout: y=14 title | y=30 artist | y=46 album
                 //         y=49-56 seekbar | y=63 time
-                u8g2.setFont(u8g2_font_unifont_t_gb2312);
+                u8g2.setFont(u8g2_font_unifont_t_japanese3);
                 drawScrollUTF8(t.title[0]  ? t.title  : "No Track", 14, t.scroll_reset, u8g2.getUTF8Width(t.title[0]  ? t.title  : "No Track"));
                 drawScrollUTF8(t.artist[0] ? t.artist : "",         30, t.scroll_reset, u8g2.getUTF8Width(t.artist[0] ? t.artist : ""));
                 drawScrollUTF8(t.album[0]  ? t.album  : "",         46, t.scroll_reset, u8g2.getUTF8Width(t.album[0]  ? t.album  : ""));
@@ -467,14 +525,14 @@ void display_task(void *param) {
         }
 
         u8g2.sendBuffer();
-        static uint32_t fps_last = 0;
-        static uint32_t fps_count = 0;
-        fps_count++;
-        if (millis() - fps_last >= 1000) {
-            Serial.printf("FPS: %lu\n", fps_count);
-            fps_count = 0;
-            fps_last = millis();
-        }
+        // static uint32_t fps_last = 0;
+        // static uint32_t fps_count = 0;
+        // fps_count++;
+        // if (millis() - fps_last >= 1000) {
+        //     Serial.printf("FPS: %lu\n", fps_count);
+        //     fps_count = 0;
+        //     fps_last = millis();
+        // }
         vTaskDelay(1);
     }
 }
@@ -538,17 +596,20 @@ void setup() {
 
     xTaskCreatePinnedToCore(chime_task,   "chime",   4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(display_task, "display", 8192, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(bt_event_task, "bt_event", 4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(led_task, "led", 1024, NULL, 1, NULL, 1);
 
     auto cfg = i2s.defaultConfig();
     cfg.pin_bck  = 18;
     cfg.pin_ws   = 23;
     cfg.pin_data = 19;
+    cfg.bits_per_sample = 16;
+    cfg.buffer_count = 8;
+    cfg.buffer_size = 512;
     i2s.begin(cfg);
 
     gif_open("/connecting.raw", 11, 8);
     setupFrequencyMapping();
-
-    enqueue_chime("/on.mp3");
 
     a2dp_sink.set_stream_reader(read_data_stream, false);
     a2dp_sink.set_on_connection_state_changed(bt_connection_changed);
@@ -559,43 +620,14 @@ void setup() {
     a2dp_sink.set_avrc_metadata_callback(avrc_metadata_callback);
     a2dp_sink.set_avrc_rn_playstatus_callback(avrc_playstatus_callback);
     a2dp_sink.set_avrc_rn_play_pos_callback(avrc_position_callback, 1); // 1s interval
+    a2dp_sink.set_avrc_rn_volumechange(avrc_volume_callback);
     a2dp_sink.set_auto_reconnect(true);
     i2s_config_t cfg_i2s = {};
-    a2dp_sink.set_bits_per_sample(16);
     a2dp_sink.start(DEVICE_NAME);
     bt_ready = true;
-    
+    enqueue_chime("/on.mp3");
 }
 
 void loop() {
     handle_buttons();
-    if (connect_chime_pending) {
-        connect_chime_pending = false;
-        enqueue_chime("/connect.mp3");
-
-        // show peer screen immediately before delay
-        xSemaphoreTake(track_mutex, portMAX_DELAY);
-        strncpy(track.peer_name, "...", 63);
-        track.show_peer  = true;
-        track.peer_until = millis() + PEER_SHOW_MS + 500; // extend by delay duration
-        xSemaphoreGive(track_mutex);
-
-        delay(500);
-
-        const char *pname = a2dp_sink.get_peer_name();
-        xSemaphoreTake(track_mutex, portMAX_DELAY);
-        strncpy(track.peer_name, (pname && pname[0]) ? pname : "Unknown Device", 63);
-        xSemaphoreGive(track_mutex);
-    }
-
-    if (!bt_connected) {
-        if (disconnect_chime_pending) {
-            disconnect_chime_pending = false;
-            enqueue_chime("/disconnect.mp3");
-        }
-        digitalWrite(LED_PIN, HIGH);
-        delay(500);
-        if (!bt_connected) digitalWrite(LED_PIN, LOW);
-        delay(500);
-    }
 }
