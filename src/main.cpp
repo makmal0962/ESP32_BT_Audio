@@ -27,7 +27,6 @@ volatile bool chime_blocking    = false;
 volatile bool connect_event     = false;
 volatile bool disconnect_event  = false;
 volatile bool bt_ready          = false;
-volatile uint8_t avrcp_volume   = 127;
 
 QueueHandle_t    chime_queue;
 SemaphoreHandle_t track_mutex;
