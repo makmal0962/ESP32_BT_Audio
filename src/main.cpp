@@ -200,7 +200,6 @@ void bt_connection_changed(esp_a2d_connection_state_t state, void *ptr) {
     if (bt_connected) {
         digitalWrite(LED_PIN, HIGH);
         xSemaphoreTake(track_mutex, portMAX_DELAY);
-        strncpy(track.peer_name, "...", 63);
         track.show_peer  = true;
         track.peer_until = millis() + PEER_SHOW_MS + 2000;
         xSemaphoreGive(track_mutex);
@@ -296,7 +295,6 @@ void setupFrequencyMapping() {
     }
 }
 
-// draw_fft — remove local snapshot, fix double log
 void draw_fft() {
     if (!audio_started) return;
     // snapshot
@@ -354,7 +352,7 @@ void draw_fft() {
         normalized = normalized < 0.0f ? 0.0f : (normalized > 1.0f ? 1.0f : normalized);
         int target = (int)(normalized * BAR_AREA);
 
-        if (target > barHeight[b]) barHeight[b] = target;
+        if (target >= barHeight[b]) barHeight[b] = target;
         else                       barHeight[b] -= BAR_DECAY;
         if (barHeight[b] < 0) barHeight[b] = 0;
 
@@ -411,7 +409,7 @@ void display_task(void *param) {
             memset(buf + 768, 0, 256);         // pages 6-7: clear for text row
 
             // device name overlay at bottom
-            u8g2.setFont(u8g2_font_helvR08_tr);
+            u8g2.setFont(u8g2_font_tallpixelextended_tr);
             u8g2.drawStr(0, 60, "Waiting for Connection...");
 
         } else if (screen_mode == SCREEN_FFT) {
@@ -448,7 +446,7 @@ void display_task(void *param) {
                 // layout: y=14 title | y=30 artist | y=46 album
                 //         y=49-56 seekbar | y=63 time
                 u8g2.setFont(u8g2_font_unifont_t_japanese3);
-                drawScrollUTF8(t.title[0]  ? t.title  : "No Track", 14, t.scroll_reset, u8g2.getUTF8Width(t.title[0]  ? t.title  : "No Track"));
+                drawScrollUTF8(t.title[0]  ? t.title  : "No Information", 14, t.scroll_reset, u8g2.getUTF8Width(t.title[0]  ? t.title  : "No Information"));
                 drawScrollUTF8(t.artist[0] ? t.artist : "",         30, t.scroll_reset, u8g2.getUTF8Width(t.artist[0] ? t.artist : ""));
                 drawScrollUTF8(t.album[0]  ? t.album  : "",         46, t.scroll_reset, u8g2.getUTF8Width(t.album[0]  ? t.album  : ""));
                 
@@ -473,6 +471,10 @@ void display_task(void *param) {
                 u8g2.setFont(u8g2_font_5x7_tf);
                 u8g2.drawStr(0, 63, pos_str);
                 u8g2.drawStr(128 - u8g2.getStrWidth(dur_str), 63, dur_str);
+
+                // peer name
+                u8g2.setFont(u8g2_font_squeezed_r6_tr);
+                u8g2.drawStr((128 - u8g2.getUTF8Width(t.peer_name)) / 2, 63, t.peer_name);
             }
         }
 
