@@ -60,7 +60,7 @@ struct GifAnim {
 GifAnim gif = {};
 
 #define FFT_SAMPLES   1024
-#define AUDIO_BUF_LEN FFT_SAMPLES * 2
+#define AUDIO_BUF_LEN FFT_SAMPLES
 #define WAVE_ZOOM 0.25f // <1.0 = zoom in (more detail), >1.0 = zoom out
 
 enum ScreenMode { SCREEN_MAIN, SCREEN_FFT, SCREEN_WAVE };
@@ -110,11 +110,11 @@ bool gif_next_frame() {
 
 
 // --- Chime ---
+MP3DecoderHelix *helix_decoder = nullptr;
 void play_chime_mp3(const char *path) {
     File f = LittleFS.open(path, "r");
-    if (!f) return;
-    MP3DecoderHelix mp3decoder;
-    EncodedAudioStream decoder(&i2s, &mp3decoder);
+    if (!f || !helix_decoder) return;
+    EncodedAudioStream decoder(&i2s, helix_decoder);
     StreamCopy copier(decoder, f);
     decoder.begin();
     while (f.available()) copier.copy();
@@ -124,8 +124,8 @@ void play_chime_mp3(const char *path) {
 
 void chime_task(void *param) {
     const char *path;
+    while (!bt_ready) vTaskDelay(10);
     for (;;) {
-        while (!bt_ready) vTaskDelay(10);
         if (xQueueReceive(chime_queue, &path, portMAX_DELAY)) {
             chime_blocking = true;
             // delay(300);
@@ -142,25 +142,19 @@ void enqueue_chime(const char *path) {
 // --- A2DP stream ---
 void read_data_stream(const uint8_t *data, uint32_t len) {
     if (chime_blocking) return;
+    i2s.write(data, len);
     audio_started = true;
-
+    // mix stereo to mono into ring buffer
     int16_t *samples = (int16_t *)data;
-    int count = len / 4;
-
-    if (xSemaphoreTake(audio_mutex, 0)) {
+    int count = len / 4; // stereo 16-bit = 4 bytes/frame
+    if (xSemaphoreTake(audio_mutex, 0)) { // non-blocking, skip if busy
         for (int i = 0; i < count; i++) {
             audio_ring[audio_ring_pos % AUDIO_BUF_LEN] =
-                (samples[i*2] / 2) + (samples[i*2+1] / 2);
+                (samples[i*2] / 2) + (samples[i*2+1] / 2); // L+R mix
             audio_ring_pos++;
         }
         xSemaphoreGive(audio_mutex);
     }
-
-    float scale = avrcp_volume / 127.0f;
-    static int16_t out[1024 * 2];
-    for (int i = 0; i < count * 2; i++)
-        out[i] = (int16_t)(samples[i] * scale);
-    i2s.write((uint8_t *)out, count * 2 * sizeof(int16_t));
 }
 
 // --- AVRCP callbacks ---
@@ -198,10 +192,6 @@ void avrc_position_callback(uint32_t pos_ms) {
     track.position_ms = pos_ms;
     track.position_ts = millis();
     xSemaphoreGive(track_mutex);
-}
-
-void avrc_volume_callback(int vol) {
-    avrcp_volume = (uint8_t)vol;
 }
 
 void bt_connection_changed(esp_a2d_connection_state_t state, void *ptr) {
@@ -306,9 +296,9 @@ void setupFrequencyMapping() {
     }
 }
 
+// draw_fft — remove local snapshot, fix double log
 void draw_fft() {
     if (!audio_started) return;
-
     // snapshot
     float snapshot[FFT_SAMPLES];
     xSemaphoreTake(audio_mutex, portMAX_DELAY);
@@ -335,75 +325,39 @@ void draw_fft() {
         barBinCount[b] += 1;
     }
 
-    const float DB_FLOOR = -40.0f;
-    const float DB_CEIL  =  0.0f;
+    const float DB_FLOOR = -60.0f;
+    const float FFT_REF  = 32768.0f * FFT_SAMPLES / 4.0f;
 
     for (int b = 0; b < NUM_BARS; b++) {
         if (barBinCount[b] > 0) {
             barMag[b] /= barBinCount[b];
-            barMag[b] = barMag[b] > 0 ? 10.0f * log10f(barMag[b]) : DB_FLOOR;
+            // single log — convert linear magnitude to dBFS
+            barMag[b] = barMag[b] > 0 ? 20.0f * log10f(barMag[b] / FFT_REF) : DB_FLOOR;
             barMag[b] = barMag[b] < DB_FLOOR ? DB_FLOOR : barMag[b];
         } else {
             barMag[b] = DB_FLOOR;
         }
     }
 
-    // peak detection with decay
-    // float current_peak = DB_FLOOR;
-    // for (int b = 0; b < NUM_BARS; b++)
-    // if (barMag[b] > current_peak) current_peak = barMag[b];
-
-    // // Decay factor – adjust to taste (0.995 = fairly slow release, 0.98 = faster release)
-    // const float PEAK_DECAY = 0.9997f;
-
-    // // Update the running peak
-    // // fft_peak = max(current_peak, fft_peak * PEAK_DECAY);
-    // fft_peak = current_peak > (fft_peak * PEAK_DECAY) ? current_peak : (fft_peak * PEAK_DECAY);
-    // if (fft_peak < DB_FLOOR) fft_peak = DB_FLOOR;
-
-    // fixed reference
-    const float FFT_REF = 32768.0f * FFT_SAMPLES / 4.0f;
-
-    uint32_t now_ms = millis();
-
-    const int BAR_DECAY           = 3; // px/frame
-    const uint32_t PEAK_BAR_HOLD_MS    = 800;
-    const int PEAK_BAR_DECAY      = 1; // px/frame
-
+    const int BAR_DECAY        = 3;
+    const uint32_t PEAK_BAR_HOLD_MS = 800;
+    const int PEAK_BAR_DECAY   = 1;
     const int BAR_AREA  = 54;
     const int BAR_WIDTH = 128 / NUM_BARS;
     const int START_X   = (128 - NUM_BARS * BAR_WIDTH) / 2;
-
-    // for (int b = 0; b < NUM_BARS; b++) {
-    //     float normalized = (barMag[b] + DB_FLOOR) / (DB_CEIL - DB_FLOOR); // 0..1
-    //     int h = constrain((int)(normalized * BAR_AREA), 0, BAR_AREA);
-    //     if (h > 0) u8g2.drawBox(START_X + b * BAR_WIDTH, 63 - h, BAR_WIDTH - 1, h);
-    // }
+    uint32_t now_ms = millis();
 
     for (int b = 0; b < NUM_BARS; b++) {
-        // float normalized = 0.0f;
-        // float peak_range = fft_peak + DB_FLOOR;
-        // if (peak_range > 1.0f) 
-        //     normalized = (barMag[b] + DB_FLOOR) / peak_range;
-
-        float db = barMag[b] > 0 ? 10.0f * log10f(barMag[b] / FFT_REF) : DB_FLOOR;
-        db = db < DB_FLOOR ? DB_FLOOR : db;
-        float normalized = (db - DB_FLOOR) / (0.0f - DB_FLOOR); // 0dBFS = full bar
+        // barMag[b] is already dBFS — use directly
+        float db = barMag[b];
+        float normalized = (db - DB_FLOOR) / (0.0f - DB_FLOOR);
         normalized = normalized < 0.0f ? 0.0f : (normalized > 1.0f ? 1.0f : normalized);
         int target = (int)(normalized * BAR_AREA);
 
-        // rise instantly, decay time-based
-        if (target > barHeight[b])
-            barHeight[b] = target;
-        else
-            barHeight[b] -= BAR_DECAY;
+        if (target > barHeight[b]) barHeight[b] = target;
+        else                       barHeight[b] -= BAR_DECAY;
         if (barHeight[b] < 0) barHeight[b] = 0;
 
-        // if (b == 0) {
-        //     Serial.printf("normalized[0]: %.2f\n", normalized);
-        //     Serial.printf("BarHeight[0]: %d\n", barHeight[0]);
-        // }
-        // peak hold dot
         if (target >= barPeakHold[b]) {
             barPeakHold[b] = target;
             barPeakMs[b]   = now_ms;
@@ -413,9 +367,7 @@ void draw_fft() {
         }
 
         int h    = constrain(barHeight[b],   0, BAR_AREA);
-        // int h = constrain((int)(normalized * BAR_AREA), 0, BAR_AREA);
         int peak = constrain(barPeakHold[b], 0, BAR_AREA);
-
         if (h > 0)    u8g2.drawBox(START_X + b * BAR_WIDTH, 63 - h, BAR_WIDTH - 1, h);
         if (peak > h) u8g2.drawHLine(START_X + b * BAR_WIDTH, 63 - peak, BAR_WIDTH - 1);
     }
@@ -459,8 +411,8 @@ void display_task(void *param) {
             memset(buf + 768, 0, 256);         // pages 6-7: clear for text row
 
             // device name overlay at bottom
-            u8g2.setFont(u8g2_font_5x7_tf);
-            u8g2.drawStr(0, 63, "Waiting for Connection...");
+            u8g2.setFont(u8g2_font_helvR08_tr);
+            u8g2.drawStr(0, 60, "Waiting for Connection...");
 
         } else if (screen_mode == SCREEN_FFT) {
             u8g2.clearBuffer();
@@ -480,7 +432,7 @@ void display_task(void *param) {
 
             if (t.show_peer && now < t.peer_until) {
                 // Connected — briefly show peer name
-                u8g2.setFont(u8g2_font_unifont_t_japanese3);
+                u8g2.setFont(u8g2_font_helvR10_tr);
                 int lw = u8g2.getUTF8Width("Connected to:");
                 u8g2.drawUTF8((128 - lw) / 2, 24, "Connected to:");
                 int pw = u8g2.getUTF8Width(t.peer_name);
@@ -595,7 +547,7 @@ void setup() {
     chime_queue = xQueueCreate(1, sizeof(const char *));
 
     xTaskCreatePinnedToCore(chime_task,   "chime",   4096, NULL, 1, NULL, 0);
-    xTaskCreatePinnedToCore(display_task, "display", 8192, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(display_task, "display", 12288, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(bt_event_task, "bt_event", 4096, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(led_task, "led", 1024, NULL, 1, NULL, 1);
 
@@ -603,13 +555,12 @@ void setup() {
     cfg.pin_bck  = 18;
     cfg.pin_ws   = 23;
     cfg.pin_data = 19;
-    cfg.bits_per_sample = 16;
-    cfg.buffer_count = 8;
-    cfg.buffer_size = 512;
     i2s.begin(cfg);
 
     gif_open("/connecting.raw", 11, 8);
     setupFrequencyMapping();
+
+    helix_decoder = new MP3DecoderHelix();
 
     a2dp_sink.set_stream_reader(read_data_stream, false);
     a2dp_sink.set_on_connection_state_changed(bt_connection_changed);
@@ -620,7 +571,6 @@ void setup() {
     a2dp_sink.set_avrc_metadata_callback(avrc_metadata_callback);
     a2dp_sink.set_avrc_rn_playstatus_callback(avrc_playstatus_callback);
     a2dp_sink.set_avrc_rn_play_pos_callback(avrc_position_callback, 1); // 1s interval
-    a2dp_sink.set_avrc_rn_volumechange(avrc_volume_callback);
     a2dp_sink.set_auto_reconnect(true);
     i2s_config_t cfg_i2s = {};
     a2dp_sink.start(DEVICE_NAME);
