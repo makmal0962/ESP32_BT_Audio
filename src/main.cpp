@@ -61,7 +61,7 @@ GifAnim gif = {};
 
 #define FFT_SAMPLES   1024
 #define AUDIO_BUF_LEN FFT_SAMPLES
-#define WAVE_ZOOM 0.25f // <1.0 = zoom in (more detail), >1.0 = zoom out
+#define WAVE_ZOOM 0.5f // <1.0 = zoom in (more detail), >1.0 = zoom out
 
 enum ScreenMode { SCREEN_MAIN, SCREEN_FFT, SCREEN_WAVE };
 volatile ScreenMode screen_mode = SCREEN_MAIN;
@@ -82,8 +82,6 @@ const int NUM_BARS = 16;
 int barHeight[NUM_BARS]     = {0}; // smoothed bar heights
 int barPeakHold[NUM_BARS]   = {0}; // peak hold per bar
 uint32_t barPeakMs[NUM_BARS]  = {0};    // timestamp of peak hold
-
-volatile bool audio_started = false;
 
 // --- GIF animation ---
 void gif_open(const char *path, uint32_t frame_count, uint32_t fps) {
@@ -143,7 +141,6 @@ void enqueue_chime(const char *path) {
 void read_data_stream(const uint8_t *data, uint32_t len) {
     if (chime_blocking) return;
     i2s.write(data, len);
-    audio_started = true;
     // mix stereo to mono into ring buffer
     int16_t *samples = (int16_t *)data;
     int count = len / 4; // stereo 16-bit = 4 bytes/frame
@@ -296,7 +293,6 @@ void setupFrequencyMapping() {
 }
 
 void draw_fft() {
-    if (!audio_started) return;
     // snapshot
     float snapshot[FFT_SAMPLES];
     xSemaphoreTake(audio_mutex, portMAX_DELAY);
@@ -337,8 +333,8 @@ void draw_fft() {
         }
     }
 
-    const int BAR_DECAY        = 3;
-    const uint32_t PEAK_BAR_HOLD_MS = 800;
+    const int BAR_DECAY        = 2;
+    const uint32_t PEAK_BAR_HOLD_MS = 750;
     const int PEAK_BAR_DECAY   = 1;
     const int BAR_AREA  = 54;
     const int BAR_WIDTH = 128 / NUM_BARS;
@@ -353,7 +349,7 @@ void draw_fft() {
         int target = (int)(normalized * BAR_AREA);
 
         if (target >= barHeight[b]) barHeight[b] = target;
-        else                       barHeight[b] -= BAR_DECAY;
+        else barHeight[b] -= BAR_DECAY;
         if (barHeight[b] < 0) barHeight[b] = 0;
 
         if (target >= barPeakHold[b]) {
@@ -396,8 +392,8 @@ void draw_waveform() {
 
 // --- Display task ---
 void display_task(void *param) {
+    u8g2.setBusClock(800000);
     u8g2.begin();
-    Wire.setClock(800000UL);
 
     for (;;) {
         uint32_t now = millis();
@@ -430,11 +426,11 @@ void display_task(void *param) {
 
             if (t.show_peer && now < t.peer_until) {
                 // Connected — briefly show peer name
-                u8g2.setFont(u8g2_font_helvR10_tr);
+                u8g2.setFont(u8g2_font_tallpixelextended_tr);
                 int lw = u8g2.getUTF8Width("Connected to:");
                 u8g2.drawUTF8((128 - lw) / 2, 24, "Connected to:");
                 int pw = u8g2.getUTF8Width(t.peer_name);
-                u8g2.drawUTF8((128 - pw) / 2, 44, t.peer_name);
+                u8g2.drawUTF8((128 - pw) / 2, 40, t.peer_name);
             } else {
                 if (t.show_peer) {
                     xSemaphoreTake(track_mutex, portMAX_DELAY);
@@ -479,14 +475,14 @@ void display_task(void *param) {
         }
 
         u8g2.sendBuffer();
-        // static uint32_t fps_last = 0;
-        // static uint32_t fps_count = 0;
-        // fps_count++;
-        // if (millis() - fps_last >= 1000) {
-        //     Serial.printf("FPS: %lu\n", fps_count);
-        //     fps_count = 0;
-        //     fps_last = millis();
-        // }
+        static uint32_t fps_last = 0;
+        static uint32_t fps_count = 0;
+        fps_count++;
+        if (millis() - fps_last >= 1000) {
+            Serial.printf("FPS: %lu\n", fps_count);
+            fps_count = 0;
+            fps_last = millis();
+        }
         vTaskDelay(1);
     }
 }
