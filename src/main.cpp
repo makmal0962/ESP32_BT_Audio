@@ -209,7 +209,19 @@ void avrc_position_callback(uint32_t pos_ms) {
     xSemaphoreGive(track_mutex);
 }
 
-// save peer address before end
+void bt_save_peer (const esp_bd_addr_t addr) {
+    prefs.begin("bt", false);
+    prefs.putBytes("peer", addr, sizeof(esp_bd_addr_t));
+    prefs.end();
+}
+
+bool bt_load_peer (esp_bd_addr_t out_addr) {
+    prefs.begin("bt", true);
+    size_t len = prefs.getBytes("peer", out_addr, sizeof(esp_bd_addr_t));
+    prefs.end();
+    return len == sizeof(esp_bd_addr_t);
+}
+
 void bt_connection_changed(esp_a2d_connection_state_t state, void *ptr) {
     bool was_connected = bt_connected;
     bt_connected = (state == ESP_A2D_CONNECTION_STATE_CONNECTED);
@@ -255,6 +267,11 @@ void bt_event_task(void *param) {
             strncpy(track.peer_name, (pname && pname[0]) ? pname : "Unknown Device", 63);
             track.peer_until = millis() + PEER_SHOW_MS;
             xSemaphoreGive(track_mutex);
+            esp_bd_addr_t* current_addr = a2dp_sink.get_current_peer_address();
+            if (current_addr != nullptr) {
+                // Store the address
+                bt_save_peer(*current_addr);
+            }
         }
 
         if (disconnect_event) {
@@ -559,7 +576,7 @@ void display_task(void *param) {
         //     fps_count = 0;
         //     fps_last = millis();
         // }
-        vTaskDelay(1);
+        // vTaskDelay(1);
     }
 }
 
@@ -605,7 +622,7 @@ void handle_buttons() {
         mode_press_ms = now;
         mode_held     = true;
     } else if (mode_btn && mode_held) {
-        if (now - mode_press_ms >= 2000) {
+        if (now - mode_press_ms >= 1000) {
             mode_held = false;
             strcpy(bottom_text, "Loading . . .");
             if (input_mode == MODE_BT) {
@@ -681,9 +698,9 @@ void loop() {
         cfg.pin_bck  = 18;
         cfg.pin_ws   = 23;
         cfg.pin_data = 19;
-        cfg.buffer_count = 8;
-        cfg.buffer_size  = 64;
         i2s.begin(cfg);
+
+        esp_bd_addr_t peer_addr;
         a2dp_sink.set_stream_reader(read_data_stream, false);
         a2dp_sink.set_on_connection_state_changed(bt_connection_changed);
         a2dp_sink.set_avrc_metadata_attribute_mask(
@@ -695,14 +712,25 @@ void loop() {
         a2dp_sink.set_avrc_rn_play_pos_callback(avrc_position_callback, 1); // 1s interval
         a2dp_sink.set_task_priority(configMAX_PRIORITIES - 5);
         a2dp_sink.set_task_core(0);
-        a2dp_sink.set_auto_reconnect(true);
-        a2dp_sink.start(DEVICE_NAME);
-        digitalWrite(INPUT_MODE_PIN, LOW);
+        // a2dp_sink.set_auto_reconnect(true);
+        a2dp_sink.start(DEVICE_NAME);        
         bt_ready = true;
         enqueue_chime("/on.mp3");
         strcpy(bottom_text, "Waiting for Connection...");
+
+        if (bt_load_peer(peer_addr)) {
+            int attempts = 0;
+            while (attempts < 20 && !bt_connected) {
+                attempts++;
+                Serial.printf("Auto connect attempt %d\n", attempts);
+                a2dp_sink.connect_to(peer_addr);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            }
+        }
     }
+    
     else if (input_mode == MODE_LINE && last_input_mode != MODE_LINE) {
+        while (chime_blocking) vTaskDelay(10);
         gif_open("/line_in.raw", 2, 2);
         if (!chime_blocking) digitalWrite(INPUT_MODE_PIN, HIGH);
         line_audio_active = true;
