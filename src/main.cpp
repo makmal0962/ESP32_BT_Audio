@@ -141,9 +141,15 @@ void chime_task(void *param) {
     while (!bt_ready) vTaskDelay(10);
     for (;;) {
         if (xQueueReceive(chime_queue, &path, portMAX_DELAY)) {
-            chime_blocking = true;
-            // delay(300);
-            play_chime_mp3(path);
+            uint32_t timeout = millis() + 5000;
+            while (ESP.getMaxAllocHeap() < 20000 && millis() < timeout) vTaskDelay(10);
+            if (millis() < timeout) {
+                chime_blocking = true;
+                play_chime_mp3(path);
+            }
+            else {
+                Serial.println("Chime skipped, heap too low/too much fragmentation!");
+            }
             chime_blocking = false;
         }
         vTaskDelay(10);
@@ -252,14 +258,10 @@ void bt_event_task(void *param) {
         if (connect_event) {
             connect_event = false;
 
-            // wait for heap to recover after BT negotiation
-            uint32_t timeout = millis() + 3000;
-            while (ESP.getMaxAllocHeap() < 20000 && millis() < timeout) vTaskDelay(50);
-
             enqueue_chime("/connect.mp3");
 
             const char *pname = nullptr;
-            vTaskDelay(pdMS_TO_TICKS(300));
+            vTaskDelay(pdMS_TO_TICKS(500));
             pname = a2dp_sink.get_peer_name();
 
             xSemaphoreTake(track_mutex, portMAX_DELAY);
@@ -275,11 +277,6 @@ void bt_event_task(void *param) {
 
         if (disconnect_event) {
             disconnect_event = false;
-
-            uint32_t timeout = millis() + 3000;
-            while (ESP.getMaxAllocHeap() < 20000 && millis() < timeout)
-                vTaskDelay(50);
-
             enqueue_chime("/disconnect.mp3");
         }
 
@@ -557,7 +554,14 @@ void display_task(void *param) {
         //     fps_count = 0;
         //     fps_last = millis();
         // }
-        // vTaskDelay(1);
+        static uint32_t heap_last = 0;
+        if (millis() - heap_last >= 1000) {
+            Serial.printf("Heap: %u\n", ESP.getFreeHeap());
+            Serial.printf("Max alloc Heap: %u\n", ESP.getMaxAllocHeap());
+            heap_last = millis();
+        };
+
+        vTaskDelay(1);
     }
 }
 
@@ -609,6 +613,7 @@ void handle_buttons() {
         if (now - mode_press_ms >= 1000) {
             mode_held = false;
             strcpy(bottom_text, "Loading . . .");
+            screen_mode = SCREEN_MAIN;
             if (input_mode == MODE_BT) {
                 a2dp_sink.end(false);
                 bt_ready = false;
@@ -676,7 +681,7 @@ void setup() {
     chime_queue = xQueueCreate(1, sizeof(const char *));
 
     xTaskCreatePinnedToCore(chime_task,   "chime",   3072, NULL, 3, NULL, 1);
-    xTaskCreatePinnedToCore(display_task, "display", 12288, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(display_task, "display", 8192, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(bt_event_task, "bt_event", 3072, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(led_task, "led", 768, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(line_adc_task, "line_adc", 4096, NULL, 1, NULL, 0);
@@ -706,6 +711,7 @@ void loop() {
         i2s.begin(cfg);
 
         esp_bd_addr_t peer_addr;
+        
         a2dp_sink.set_stream_reader(read_data_stream, false);
         a2dp_sink.set_on_connection_state_changed(bt_connection_changed);
         a2dp_sink.set_avrc_metadata_attribute_mask(
@@ -718,6 +724,7 @@ void loop() {
         a2dp_sink.set_task_priority(configMAX_PRIORITIES - 5);
         a2dp_sink.set_task_core(0);
         // a2dp_sink.set_auto_reconnect(true);
+
         a2dp_sink.start(DEVICE_NAME);        
         bt_ready = true;
         enqueue_chime("/on.mp3");
@@ -728,25 +735,18 @@ void loop() {
             while (attempts < 20 && !bt_connected) {
                 attempts++;
                 Serial.printf("Auto connect attempt %d\n", attempts);
-                a2dp_sink.connect_to(peer_addr);
                 vTaskDelay(pdMS_TO_TICKS(2000));
+                a2dp_sink.connect_to(peer_addr);
             }
         }
     }
 
     else if (input_mode == MODE_LINE && last_input_mode != MODE_LINE) {
-        while (chime_blocking) vTaskDelay(10);
+        // while (chime_blocking) vTaskDelay(10);
         gif_open("/line_in.raw", 2, 2);
         if (!chime_blocking) digitalWrite(INPUT_MODE_PIN, HIGH);
         line_audio_active = true;
         strcpy(bottom_text, "Line Input Mode");
     }
     last_input_mode = input_mode;
-
-    // static uint32_t heap_last = 0;
-    // if (millis() - heap_last >= 1000) {
-    //     Serial.printf("Heap: %u\n", ESP.getFreeHeap());
-    //     Serial.printf("Max alloc Heap: %u\n", ESP.getMaxAllocHeap());
-    //     heap_last = millis();
-    // };
 }
