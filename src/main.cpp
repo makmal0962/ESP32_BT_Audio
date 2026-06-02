@@ -5,11 +5,12 @@
 #include <Wire.h>
 #include "AudioTools/AudioCodecs/CodecMP3Helix.h"
 #include "arduinoFFT.h"
+#include "bintobar_generated.h"
 
 #define LED_PIN         2
 #define DEVICE_NAME     "ESP32 BT Audio"
 #define PEER_SHOW_MS    2000
-#define SCROLL_SPEED    19   // px/sec
+#define SCROLL_SPEED    20   // px/sec
 #define SCROLL_GAP      64   // px between loop
 
 #define BTN_PLAY 26
@@ -74,7 +75,7 @@ float fft_imag[FFT_SAMPLES];
 ArduinoFFT<float> FFT(fft_real, fft_imag, FFT_SAMPLES, 44100.0);
 
 const int NYQUIST_BINS = FFT_SAMPLES / 2;
-int binToBar[NYQUIST_BINS];          // bar index for each FFT bin (1..NYQUIST_BINS-1)
+// int binToBar[NYQUIST_BINS];          // bar index for each FFT bin (1..NYQUIST_BINS-1)
 const float SAMPLE_RATE = 44100.0;
 const int NUM_BARS = 16;
 
@@ -116,6 +117,7 @@ void play_chime_mp3(const char *path) {
     decoder.begin();
     while (f.available()) copier.copy();
     decoder.end();
+
     f.close();
 }
 
@@ -129,6 +131,7 @@ void chime_task(void *param) {
             play_chime_mp3(path);
             chime_blocking = false;
         }
+        vTaskDelay(10);
     }
 }
 
@@ -195,19 +198,22 @@ void bt_connection_changed(esp_a2d_connection_state_t state, void *ptr) {
     bt_connected = (state == ESP_A2D_CONNECTION_STATE_CONNECTED);
     if (bt_connected) {
         digitalWrite(LED_PIN, HIGH);
-        xSemaphoreTake(track_mutex, portMAX_DELAY);
-        track.show_peer  = true;
-        track.peer_until = millis() + PEER_SHOW_MS + 2000;
-        xSemaphoreGive(track_mutex);
+        if (xSemaphoreTake(track_mutex, pdMS_TO_TICKS(100))) {
+            track.show_peer  = true;
+            track.peer_until = millis() + PEER_SHOW_MS + 2000;
+            xSemaphoreGive(track_mutex);
+        }
         connect_event = true;
     } else if (was_connected) {
-        xSemaphoreTake(track_mutex, portMAX_DELAY);
-        memset(track.title,  0, sizeof(track.title));
-        memset(track.artist, 0, sizeof(track.artist));
-        memset(track.album,  0, sizeof(track.album));
-        track.duration_ms = track.position_ms = 0;
-        track.playing     = false;
-        xSemaphoreGive(track_mutex);
+        if (xSemaphoreTake(track_mutex, pdMS_TO_TICKS(100))) {
+            memset(track.title,     0, sizeof(track.title));
+            memset(track.artist,    0, sizeof(track.artist));
+            memset(track.album,     0, sizeof(track.album));
+            memset(track.peer_name, 0, sizeof(track.peer_name));
+            track.duration_ms = track.position_ms = 0;
+            track.playing     = false;
+            xSemaphoreGive(track_mutex);
+        }
         disconnect_event = true;
     }
 }
@@ -217,14 +223,16 @@ void bt_event_task(void *param) {
         while (!bt_ready) vTaskDelay(10);
         if (connect_event) {
             connect_event = false;
+
+            // wait for heap to recover after BT negotiation
+            uint32_t timeout = millis() + 3000;
+            while (ESP.getMaxAllocHeap() < 20000 && millis() < timeout) vTaskDelay(50);
+
             enqueue_chime("/connect.mp3");
 
-            uint32_t timeout = millis() + 2000;
             const char *pname = nullptr;
-            do {
-                vTaskDelay(10);
-                pname = a2dp_sink.get_peer_name();
-            } while ((!pname || pname[0] == '\0') && millis() < timeout);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            pname = a2dp_sink.get_peer_name();
 
             xSemaphoreTake(track_mutex, portMAX_DELAY);
             strncpy(track.peer_name, (pname && pname[0]) ? pname : "Unknown Device", 63);
@@ -234,6 +242,11 @@ void bt_event_task(void *param) {
 
         if (disconnect_event) {
             disconnect_event = false;
+
+            uint32_t timeout = millis() + 3000;
+            while (ESP.getMaxAllocHeap() < 20000 && millis() < timeout)
+                vTaskDelay(50);
+
             enqueue_chime("/disconnect.mp3");
         }
 
@@ -275,21 +288,21 @@ void drawScrollUTF8(const char *text, int y, uint32_t scroll_start, int tw) {
 }
 
 // --- FFT Display ---
-void setupFrequencyMapping() {
-    float f_min = (float)SAMPLE_RATE / FFT_SAMPLES;   // 86 Hz – lowest possible
-    float f_max = SAMPLE_RATE / 2.0;                  // 22050 Hz
-    float logMin = log10(f_min);
-    float logMax = log10(f_max);
+// void setupFrequencyMapping() {
+//     float f_min = (float)SAMPLE_RATE / FFT_SAMPLES;   // 86 Hz – lowest possible
+//     float f_max = SAMPLE_RATE / 2.0;                  // 22050 Hz
+//     float logMin = log10(f_min);
+//     float logMax = log10(f_max);
     
-    // For each bin (k=1..NYQUIST_BINS-1), compute its frequency and bar index
-    for (int k = 1; k < NYQUIST_BINS; k++) {
-        float freq = (float)k * SAMPLE_RATE / FFT_SAMPLES;
-        // Logarithmic mapping: bar = (log10(freq) - logMin) / (logMax - logMin) * NUM_BARS
-        float t = (log10(freq) - logMin) / (logMax - logMin);
-        int bar = constrain((int)(t * NUM_BARS), 0, NUM_BARS - 1);
-        binToBar[k] = bar;
-    }
-}
+//     // For each bin (k=1..NYQUIST_BINS-1), compute its frequency and bar index
+//     for (int k = 1; k < NYQUIST_BINS; k++) {
+//         float freq = (float)k * SAMPLE_RATE / FFT_SAMPLES;
+//         // Logarithmic mapping: bar = (log10(freq) - logMin) / (logMax - logMin) * NUM_BARS
+//         float t = (log10(freq) - logMin) / (logMax - logMin);
+//         int bar = constrain((int)(t * NUM_BARS), 0, NUM_BARS - 1);
+//         binToBar[k] = bar;
+//     }
+// }
 
 void draw_fft() {
     // snapshot
@@ -313,7 +326,8 @@ void draw_fft() {
     float barMag[NUM_BARS]      = {};
 
     for (int k = 1; k < NYQUIST_BINS; k++) {
-        int b = binToBar[k];
+        // int b = binToBar[k];
+        int b = (int8_t)pgm_read_byte(&binToBar[k - 1]); 
         barMag[b]      += fft_real[k];
         barBinCount[b] += 1;
     }
@@ -474,14 +488,14 @@ void display_task(void *param) {
         }
 
         u8g2.sendBuffer();
-        static uint32_t fps_last = 0;
-        static uint32_t fps_count = 0;
-        fps_count++;
-        if (millis() - fps_last >= 1000) {
-            Serial.printf("FPS: %lu\n", fps_count);
-            fps_count = 0;
-            fps_last = millis();
-        }
+        // static uint32_t fps_last = 0;
+        // static uint32_t fps_count = 0;
+        // fps_count++;
+        // if (millis() - fps_last >= 1000) {
+        //     Serial.printf("FPS: %u\n", fps_count);
+        //     fps_count = 0;
+        //     fps_last = millis();
+        // }
         vTaskDelay(1);
     }
 }
@@ -543,19 +557,21 @@ void setup() {
     audio_mutex = xSemaphoreCreateMutex();
     chime_queue = xQueueCreate(1, sizeof(const char *));
 
-    xTaskCreatePinnedToCore(chime_task,   "chime",   4096, NULL, 1, NULL, 0);
-    xTaskCreatePinnedToCore(display_task, "display", 12288, NULL, 2, NULL, 1);
-    xTaskCreatePinnedToCore(bt_event_task, "bt_event", 4096, NULL, 1, NULL, 1);
-    xTaskCreatePinnedToCore(led_task, "led", 1024, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(chime_task,   "chime",   3072, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(display_task, "display", 8192, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(bt_event_task, "bt_event", 3072, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(led_task, "led", 768, NULL, 1, NULL, 1);
 
     auto cfg = i2s.defaultConfig();
     cfg.pin_bck  = 18;
     cfg.pin_ws   = 23;
     cfg.pin_data = 19;
+    cfg.buffer_count = 8;
+    cfg.buffer_size  = 64;
     i2s.begin(cfg);
 
     gif_open("/connecting.raw", 11, 8);
-    setupFrequencyMapping();
+    // setupFrequencyMapping();
 
     helix_decoder = new MP3DecoderHelix();
 
@@ -569,6 +585,8 @@ void setup() {
     a2dp_sink.set_avrc_rn_playstatus_callback(avrc_playstatus_callback);
     a2dp_sink.set_avrc_rn_play_pos_callback(avrc_position_callback, 1); // 1s interval
     a2dp_sink.set_auto_reconnect(true);
+    a2dp_sink.set_task_priority(configMAX_PRIORITIES - 5);
+    a2dp_sink.set_task_core(0);
     i2s_config_t cfg_i2s = {};
     a2dp_sink.start(DEVICE_NAME);
     bt_ready = true;
@@ -577,4 +595,10 @@ void setup() {
 
 void loop() {
     handle_buttons();
+    // static uint32_t heap_last = 0;
+    // if (millis() - heap_last >= 1000) {
+    //     Serial.printf("Heap: %u\n", ESP.getFreeHeap());
+    //     Serial.printf("Max alloc Heap: %u\n", ESP.getMaxAllocHeap());
+    //     heap_last = millis();
+    // }
 }
