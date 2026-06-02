@@ -366,25 +366,7 @@ void drawScrollUTF8(const char *text, int y, uint32_t scroll_start, int tw) {
     u8g2.drawUTF8(-offset + period, y, text);
 }
 
-// --- FFT Display ---
-// void setupFrequencyMapping() {
-//     float f_min = (float)SAMPLE_RATE / FFT_SAMPLES;   // 86 Hz – lowest possible
-//     float f_max = SAMPLE_RATE / 2.0;                  // 22050 Hz
-//     float logMin = log10(f_min);
-//     float logMax = log10(f_max);
-    
-//     // For each bin (k=1..NYQUIST_BINS-1), compute its frequency and bar index
-//     for (int k = 1; k < NYQUIST_BINS; k++) {
-//         float freq = (float)k * SAMPLE_RATE / FFT_SAMPLES;
-//         // Logarithmic mapping: bar = (log10(freq) - logMin) / (logMax - logMin) * NUM_BARS
-//         float t = (log10(freq) - logMin) / (logMax - logMin);
-//         int bar = constrain((int)(t * NUM_BARS), 0, NUM_BARS - 1);
-//         binToBar[k] = bar;
-//     }
-// }
-
 void draw_fft() {
-    // snapshot
     xSemaphoreTake(audio_mutex, portMAX_DELAY);
     uint32_t start = audio_ring_pos;
     for (int i = 0; i < FFT_SAMPLES; i++) {
@@ -401,7 +383,6 @@ void draw_fft() {
     float barMag[NUM_BARS]      = {};
 
     for (int k = 1; k < NYQUIST_BINS; k++) {
-        // int b = binToBar[k];
         int b = (int8_t)pgm_read_byte(&binToBar[k - 1]); 
         barMag[b]      += fft_real[k];
         barBinCount[b] += 1;
@@ -760,11 +741,12 @@ void loop() {
         line_audio_active = true;
         strcpy(bottom_text, "Line Input Mode");
     }
+    last_input_mode = input_mode;
+
     // static uint32_t heap_last = 0;
     // if (millis() - heap_last >= 1000) {
     //     Serial.printf("Heap: %u\n", ESP.getFreeHeap());
     //     Serial.printf("Max alloc Heap: %u\n", ESP.getMaxAllocHeap());
     //     heap_last = millis();
     // };
-    last_input_mode = input_mode;
 }
