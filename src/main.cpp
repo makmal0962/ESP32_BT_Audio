@@ -22,7 +22,7 @@ Preferences prefs;
 #define BTN_PREV 16
 #define BTN_NEXT 17
 #define BTN_MODE 25
-#define DEBOUNCE_MS 100
+#define DEBOUNCE_MS 50
 
 #define INPUT_MODE_PIN  27
 #define ADC_PIN         35
@@ -40,7 +40,6 @@ volatile bool bt_ready          = false;
 
 QueueHandle_t    chime_queue;
 SemaphoreHandle_t track_mutex;
-uint32_t last_btn_ms = 0;
 
 struct TrackInfo {
     char     title[128];
@@ -288,6 +287,7 @@ void bt_event_task(void *param) {
     }
 }
 
+// --- LED indicator ---
 void led_task(void *param) {
     for (;;) {
         while (!bt_ready) vTaskDelay(10);
@@ -302,8 +302,7 @@ void led_task(void *param) {
     }
 }
 
-// --- ADC helpers ---
-
+// --- ADC helper (for line input) ---
 void line_adc_task(void *param) {
     for (;;) {
         while (!line_audio_active) vTaskDelay(10);
@@ -456,6 +455,7 @@ void draw_fft() {
     }
 }
 
+// --- Waveform Display ---
 void draw_waveform() {
     float snapshot[128];
     xSemaphoreTake(audio_mutex, portMAX_DELAY);
@@ -588,13 +588,16 @@ void save_state() {
     prefs.end();
 }
 
+// --- Button handling ---
 void handle_buttons() {
     static uint32_t play_press_ms  = 0;
     static uint32_t mode_press_ms  = 0;
+    static uint32_t prev_press_ms  = 0;
+    static uint32_t next_press_ms  = 0;
     static bool     play_held      = false;
     static bool     mode_held      = false;
-    static bool     prev_last      = HIGH;
-    static bool     next_last      = HIGH;
+    static bool     prev_held      = false;
+    static bool     next_held      = false;
     uint32_t now = millis();
 
     bool play_btn = !digitalRead(BTN_PLAY);
@@ -643,15 +646,36 @@ void handle_buttons() {
     }
 
     bool prev_btn = !digitalRead(BTN_PREV);
-    bool next_btn = !digitalRead(BTN_NEXT);
-
-    if (now - last_btn_ms > DEBOUNCE_MS) {
-        if (prev_btn && !prev_last) { last_btn_ms = now; a2dp_sink.previous(); }
-        if (next_btn && !next_last) { last_btn_ms = now; a2dp_sink.next(); }
+    if (prev_btn && !prev_held) {
+        prev_press_ms = now;
+        prev_held     = true;
+    } else if (prev_btn && prev_held) {
+        if (now - prev_press_ms >= 1000) {
+            prev_held = false;
+            // for future use
+        }
+    } else if (!prev_btn && prev_held) {
+        prev_held = false;
+        if (now - prev_press_ms >= DEBOUNCE_MS) {
+            a2dp_sink.previous();
+        }
     }
-
-    prev_last = prev_btn;
-    next_last = next_btn;
+    
+    bool next_btn = !digitalRead(BTN_NEXT);
+    if (next_btn && !next_held) {
+        next_press_ms = now;
+        next_held     = true;
+    } else if (next_btn && next_held) {
+        if (now - next_press_ms >= 1000) {
+            next_held = false;
+            // for future use
+        }
+    } else if (!next_btn && next_held) {
+        next_held = false;
+        if (now - next_press_ms >= DEBOUNCE_MS) {
+            a2dp_sink.next();
+        }
+    }
 }
 
 // --- Setup ---
@@ -728,7 +752,7 @@ void loop() {
             }
         }
     }
-    
+
     else if (input_mode == MODE_LINE && last_input_mode != MODE_LINE) {
         while (chime_blocking) vTaskDelay(10);
         gif_open("/line_in.raw", 2, 2);
