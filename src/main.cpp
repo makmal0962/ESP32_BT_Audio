@@ -10,8 +10,6 @@
 #include <driver/adc.h>
 #include <driver/i2s.h>
 
-Preferences prefs;
-
 #define LED_PIN         2
 #define DEVICE_NAME     "ESP32 BT Audio"
 #define PEER_SHOW_MS    2000
@@ -29,24 +27,18 @@ Preferences prefs;
 #define ADC_CHANNEL     ADC1_CHANNEL_7 // GPIO35
 #define ADC_I2S_PORT I2S_NUM_0 
 
-I2SStream i2s;
-BluetoothA2DPSink a2dp_sink(i2s);
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+#define FFT_SAMPLES   1024
+#define AUDIO_BUF_LEN FFT_SAMPLES
+#define WAVE_ZOOM 0.3 // <1.0 = zoom in (more detail), >1.0 = zoom out
 
-volatile bool bt_connected      = false;
-volatile bool chime_blocking    = false;
-volatile bool connect_event     = false;
-volatile bool disconnect_event  = false;
-volatile bool bt_ready          = false;
+const int NYQUIST_BINS = FFT_SAMPLES / 2;
+// int binToBar[NYQUIST_BINS];          // bar index for each FFT bin (1..NYQUIST_BINS-1)
+const float SAMPLE_RATE = 44100.0;
+const int NUM_BARS = 16;
 
-volatile bool bt_shutdown_pending = false;
-volatile bool start_adc_pending = false;
-volatile bool stop_adc_pending = false;
-volatile bool adc_stopped = true;
-volatile bool auto_reconnect_enabled = true;
-
-QueueHandle_t    chime_queue;
-SemaphoreHandle_t track_mutex;
+float fft_real[FFT_SAMPLES];
+float fft_imag[FFT_SAMPLES];
+int16_t audio_ring[AUDIO_BUF_LEN];
 
 struct TrackInfo {
     char     title[128];
@@ -61,9 +53,6 @@ struct TrackInfo {
     uint32_t peer_until;
     uint32_t scroll_reset;  // millis() when track changed -> resets scroll
 };
-
-char bottom_text[64] = "";
-
 TrackInfo track = {};
 
 struct GifAnim {
@@ -76,36 +65,43 @@ struct GifAnim {
 };
 GifAnim gif = {};
 
-enum InputMode { MODE_IDLE, MODE_BT, MODE_LINE };
-volatile InputMode input_mode = MODE_BT;
-InputMode last_input_mode = MODE_IDLE;
-
-#define FFT_SAMPLES   1024
-#define AUDIO_BUF_LEN FFT_SAMPLES
-#define WAVE_ZOOM 0.3 // <1.0 = zoom in (more detail), >1.0 = zoom out
-
-enum ScreenMode { SCREEN_MAIN, SCREEN_FFT, SCREEN_WAVE };
-volatile ScreenMode screen_mode = SCREEN_MAIN;
-
-int16_t  audio_ring[AUDIO_BUF_LEN];
-uint32_t audio_ring_pos = 0;
-SemaphoreHandle_t audio_mutex;
-volatile bool line_audio_active = false;
-
-float fft_real[FFT_SAMPLES];
-float fft_imag[FFT_SAMPLES];
-ArduinoFFT<float> FFT(fft_real, fft_imag, FFT_SAMPLES, 44100.0);
-
-const int NYQUIST_BINS = FFT_SAMPLES / 2;
-// int binToBar[NYQUIST_BINS];          // bar index for each FFT bin (1..NYQUIST_BINS-1)
-const float SAMPLE_RATE = 44100.0;
-const int NUM_BARS = 16;
-
 int barHeight[NUM_BARS]     = {0}; // smoothed bar heights
 int barPeakHold[NUM_BARS]   = {0}; // peak hold per bar
 uint32_t barPeakMs[NUM_BARS]  = {0};    // timestamp of peak hold
 
-int32_t adc_dc_avg = 0;
+ArduinoFFT<float> FFT(fft_real, fft_imag, FFT_SAMPLES, 44100.0);
+
+QueueHandle_t     chime_queue;
+SemaphoreHandle_t track_mutex;
+SemaphoreHandle_t audio_mutex;
+
+uint32_t audio_ring_pos  = 0;
+int32_t adc_dc_avg      = 0;
+char bottom_text[64] = "";
+
+volatile bool bt_connected           = false;
+volatile bool chime_blocking         = false;
+volatile bool connect_event          = false;
+volatile bool disconnect_event       = false;
+volatile bool bt_ready               = false;
+volatile bool bt_shutdown_pending    = false;
+volatile bool start_adc_pending      = false;
+volatile bool stop_adc_pending       = false;
+volatile bool adc_stopped            = true;
+volatile bool auto_reconnect_enabled = true;
+volatile bool line_audio_active      = false;
+
+enum InputMode { MODE_IDLE, MODE_BT, MODE_LINE };
+volatile InputMode input_mode = MODE_BT;
+InputMode last_input_mode = MODE_IDLE;
+
+enum ScreenMode { SCREEN_MAIN, SCREEN_FFT, SCREEN_WAVE };
+volatile ScreenMode screen_mode = SCREEN_MAIN;
+
+Preferences prefs;
+I2SStream i2s;
+BluetoothA2DPSink a2dp_sink(i2s);
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 
 // --- GIF animation ---
 void gif_open(const char *path, uint32_t frame_count, uint32_t fps) {
@@ -151,7 +147,7 @@ void chime_task(void *param) {
     for (;;) {
         if (xQueueReceive(chime_queue, &path, portMAX_DELAY)) {
             uint32_t timeout = millis() + 5000;
-            while (ESP.getMaxAllocHeap() < 20000 && millis() < timeout) vTaskDelay(10);
+            while (ESP.getMaxAllocHeap() < 18000 && millis() < timeout) vTaskDelay(100);
             if (millis() < timeout) {
                 chime_blocking = true;
                 play_chime_mp3(path);
@@ -287,11 +283,10 @@ void core_0_loop(void *param) {
             start_adc_pending = false;
 
             // start line ADC
-            if (chime_blocking) Serial.println("Start ADC blocked by chime. waiting");
+            if (chime_blocking) Serial.println("Start ADC blocked by chime busy. waiting");
             while(chime_blocking) vTaskDelay(10);
             Serial.println("Stopping I2S");
             i2s.end();
-            i2s_driver_uninstall(ADC_I2S_PORT);
 
             gpio_reset_pin((gpio_num_t)18);
             gpio_reset_pin((gpio_num_t)23);
@@ -740,9 +735,34 @@ void handle_buttons() {
     }
 }
 
+void dump_heap_blocks() {
+    multi_heap_info_t info;
+    heap_caps_get_info(&info, MALLOC_CAP_8BIT);
+    Serial.printf("Total free: %u\n",      info.total_free_bytes);
+    Serial.printf("Total allocated: %u\n", info.total_allocated_bytes);
+    Serial.printf("Largest block: %u\n",   info.largest_free_block);
+    Serial.printf("Min ever free: %u\n",   info.minimum_free_bytes);
+    Serial.printf("Alloc blocks: %u\n",    info.allocated_blocks);
+    Serial.printf("Free blocks: %u\n",     info.free_blocks);
+}
+
+void dump_heap() {
+    Serial.printf("=== HEAP DUMP ===\n");
+    Serial.printf("Free: %u  MaxAlloc: %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    
+    // print all free blocks
+    heap_caps_print_heap_info(MALLOC_CAP_8BIT);
+    
+    Serial.printf("=================\n");
+}
+
 // --- Setup ---
 void setup() {
     Serial.begin(115200);
+    esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+    Serial.printf("Starting ESP32. MaxAlloc: %u\n", ESP.getMaxAllocHeap());
+    // dump_heap();
+    // dump_heap_blocks();
     pinMode(LED_PIN, OUTPUT);
     pinMode(INPUT_MODE_PIN, OUTPUT);
     digitalWrite(INPUT_MODE_PIN, LOW);
@@ -758,7 +778,7 @@ void setup() {
 
     xTaskCreatePinnedToCore(chime_task,   "chime",   3072, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(display_task, "display", 10240, NULL, 2, NULL, 1);
-    xTaskCreatePinnedToCore(core_0_loop, "core_0_loop", 6144, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(core_0_loop, "core_0_loop", 4096, NULL, 2, NULL, 0);
 
     gif_open("/connecting.raw", 11, 8);
     strcpy(bottom_text, "Loading . . .");
@@ -809,6 +829,8 @@ void loop() {
         vTaskDelay(pdMS_TO_TICKS(1000));
         bt_ready = true;
         Serial.printf("[BT] after bt_ready | Heap: %u MaxAlloc: %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        // dump_heap();
+        // dump_heap_blocks();
     }
 
     else if (input_mode == MODE_LINE && last_input_mode != MODE_LINE) {
