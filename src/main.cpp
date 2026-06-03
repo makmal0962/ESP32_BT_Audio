@@ -47,11 +47,11 @@ struct TrackInfo {
     char     peer_name[64];
     uint32_t duration_ms;
     uint32_t position_ms;
-    uint32_t position_ts;   // millis() at last AVRCP position update
+    uint32_t position_ts;
     bool     playing;
     bool     show_peer;
     uint32_t peer_until;
-    uint32_t scroll_reset;  // millis() when track changed -> resets scroll
+    uint32_t scroll_reset;
 };
 TrackInfo track = {};
 
@@ -146,14 +146,16 @@ void chime_task(void *param) {
     const char *path;
     for (;;) {
         if (xQueueReceive(chime_queue, &path, portMAX_DELAY)) {
+            Serial.printf("Chime: %s, MaxAlloc: %u\n", path, ESP.getMaxAllocHeap());
+            if (ESP.getMaxAllocHeap() < 18000) Serial.println("[W] Chime: Heap too low, waiting");
             uint32_t timeout = millis() + 5000;
             while (ESP.getMaxAllocHeap() < 18000 && millis() < timeout) vTaskDelay(100);
-            if (millis() < timeout) {
+            if (ESP.getMaxAllocHeap() >= 18000) {
                 chime_blocking = true;
                 play_chime_mp3(path);
             }
             else {
-                Serial.println("Chime skipped, heap too low/too much fragmentation!");
+                Serial.println("[E] Chime: Skipped, heap too low/too much fragmentation!");
             }
             chime_blocking = false;
         }
@@ -615,12 +617,12 @@ void display_task(void *param) {
         //     fps_count = 0;
         //     fps_last = millis();
         // }
-        static uint32_t heap_last = 0;
-        if (millis() - heap_last >= 1000) {
-            Serial.printf("[loop] Heap: %u\n", ESP.getFreeHeap());
-            Serial.printf("[loop] Max alloc Heap: %u\n", ESP.getMaxAllocHeap());
-            heap_last = millis();
-        };
+        // static uint32_t heap_last = 0;
+        // if (millis() - heap_last >= 1000) {
+        //     Serial.printf("[loop] Heap: %u\n", ESP.getFreeHeap());
+        //     Serial.printf("[loop] Max alloc Heap: %u\n", ESP.getMaxAllocHeap());
+        //     heap_last = millis();
+        // };
 
         vTaskDelay(1);
     }
@@ -685,6 +687,7 @@ void handle_buttons() {
             strcpy(bottom_text, "Loading . . .");
             screen_mode = SCREEN_MAIN;
             if (input_mode == MODE_BT) {
+                enqueue_chime("/disconnect.mp3");
                 bt_shutdown_pending = true;
                 while (bt_ready) vTaskDelay(10);
                 input_mode   = MODE_LINE;
