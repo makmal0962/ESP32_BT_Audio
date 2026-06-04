@@ -79,21 +79,21 @@ uint32_t audio_ring_pos  = 0;
 int32_t adc_dc_avg      = 0;
 char bottom_text[64] = "";
 
-volatile bool bt_connected           = false;
-volatile bool chime_blocking         = false;
-volatile bool connect_event          = false;
-volatile bool disconnect_event       = false;
-volatile bool bt_ready               = false;
-volatile bool bt_shutdown_pending    = false;
-volatile bool start_adc_pending      = false;
-volatile bool stop_adc_pending       = false;
-volatile bool adc_stopped            = true;
-volatile bool auto_reconnect_enabled = true;
-volatile bool line_audio_active      = false;
+volatile bool bt_connected              = false;
+volatile bool chime_blocking            = false;
+volatile bool connect_event             = false;
+volatile bool disconnect_event          = false;
+volatile bool bt_ready                  = false;
+volatile bool bt_shutdown_pending       = false;
+volatile bool start_adc_pending         = false;
+volatile bool stop_adc_pending          = false;
+volatile bool adc_stopped               = true;
+volatile bool auto_reconnect_enabled    = true;
+volatile bool line_audio_active         = false;
+bool          mode_switching            = true;
 
-enum InputMode { MODE_IDLE, MODE_BT, MODE_LINE };
+enum InputMode { MODE_BT, MODE_LINE };
 volatile InputMode input_mode = MODE_BT;
-InputMode last_input_mode = MODE_IDLE;
 
 enum ScreenMode { SCREEN_MAIN, SCREEN_FFT, SCREEN_WAVE };
 volatile ScreenMode screen_mode = SCREEN_MAIN;
@@ -545,84 +545,92 @@ void display_task(void *param) {
     for (;;) {
         uint32_t now = millis();
 
-        if (screen_mode == SCREEN_MAIN) {
-            if (!bt_connected || input_mode == MODE_LINE) {
-                // animation screen
-                if (input_mode == MODE_BT || digitalRead(PIN_LINE_MODE)) gif_next_frame();
-                uint8_t *buf = u8g2.getBufferPtr();
-                memcpy(buf, gif.frame_buf, 768);   // pages 0-5: gif (128x48)
-                memset(buf + 768, 0, 256);         // pages 6-7: clear for text row
+        switch (screen_mode) {
+            case SCREEN_MAIN: {
+                if (!bt_connected || input_mode == MODE_LINE) {
+                    // animation screen
+                    if (input_mode == MODE_BT || digitalRead(PIN_LINE_MODE)) gif_next_frame();
+                    uint8_t *buf = u8g2.getBufferPtr();
+                    memcpy(buf, gif.frame_buf, 768);   // pages 0-5: gif (128x48)
+                    memset(buf + 768, 0, 256);         // pages 6-7: clear for text row
 
-                // device name overlay at bottom
-                u8g2.setFont(u8g2_font_tallpixelextended_tr);
-                u8g2.drawUTF8((128 - u8g2.getUTF8Width(bottom_text)) / 2, 60, bottom_text);
-            } else {
-                // bluetooth main screen
-                u8g2.clearBuffer();
-                xSemaphoreTake(track_mutex, portMAX_DELAY);
-                TrackInfo t = track;
-                xSemaphoreGive(track_mutex);
-
-                if (t.show_peer && now < t.peer_until) {
-                    // Connected — briefly show peer name
+                    // device name overlay at bottom
                     u8g2.setFont(u8g2_font_tallpixelextended_tr);
-                    int lw = u8g2.getUTF8Width("Connected to:");
-                    u8g2.drawUTF8((128 - lw) / 2, 24, "Connected to:");
-                    int pw = u8g2.getUTF8Width(t.peer_name);
-                    u8g2.drawUTF8((128 - pw) / 2, 40, t.peer_name);
+                    u8g2.drawUTF8((128 - u8g2.getUTF8Width(bottom_text)) / 2, 60, bottom_text);
                 } else {
-                    if (t.show_peer) {
-                        xSemaphoreTake(track_mutex, portMAX_DELAY);
-                        track.show_peer = false;
-                        xSemaphoreGive(track_mutex);
+                    // bluetooth main screen
+                    u8g2.clearBuffer();
+                    xSemaphoreTake(track_mutex, portMAX_DELAY);
+                    TrackInfo t = track;
+                    xSemaphoreGive(track_mutex);
+
+                    if (t.show_peer && now < t.peer_until) {
+                        // Connected — briefly show peer name
+                        u8g2.setFont(u8g2_font_tallpixelextended_tr);
+                        int lw = u8g2.getUTF8Width("Connected to:");
+                        u8g2.drawUTF8((128 - lw) / 2, 24, "Connected to:");
+                        int pw = u8g2.getUTF8Width(t.peer_name);
+                        u8g2.drawUTF8((128 - pw) / 2, 40, t.peer_name);
+                    } else {
+                        if (t.show_peer) {
+                            xSemaphoreTake(track_mutex, portMAX_DELAY);
+                            track.show_peer = false;
+                            xSemaphoreGive(track_mutex);
+                        }
+
+                        // Main screen
+                        // layout: y=14 title | y=30 artist | y=46 album
+                        //         y=49-56 seekbar | y=63 time
+                        u8g2.setFont(u8g2_font_unifont_t_japanese3);
+                        drawScrollUTF8(t.title[0]  ? t.title  : "No Information", 14, t.scroll_reset, u8g2.getUTF8Width(t.title[0]  ? t.title  : "No Information"));
+                        drawScrollUTF8(t.artist[0] ? t.artist : "",         30, t.scroll_reset, u8g2.getUTF8Width(t.artist[0] ? t.artist : ""));
+                        drawScrollUTF8(t.album[0]  ? t.album  : "",         46, t.scroll_reset, u8g2.getUTF8Width(t.album[0]  ? t.album  : ""));
+                        
+                        // Interpolate position
+                        uint32_t pos = t.position_ms;
+                        if (t.playing && t.position_ts > 0)
+                            pos += (now - t.position_ts);
+                        if (t.duration_ms > 0 && pos > t.duration_ms)
+                            pos = t.duration_ms;
+
+                        // Seekbar
+                        u8g2.drawFrame(0, 49, 128, 7);
+                        if (t.duration_ms > 0) {
+                            int fill = (int)(128ULL * pos / t.duration_ms);
+                            if (fill > 0) u8g2.drawBox(0, 49, fill, 7);
+                        }
+
+                        // Time
+                        char pos_str[8], dur_str[8];
+                        formatTime(pos, pos_str);
+                        formatTime(t.duration_ms, dur_str);
+                        u8g2.setFont(u8g2_font_5x7_tf);
+                        u8g2.drawStr(0, 63, pos_str);
+                        u8g2.drawStr(128 - u8g2.getStrWidth(dur_str), 63, dur_str);
+
+                        // peer name
+                        u8g2.setFont(u8g2_font_squeezed_r6_tr);
+                        u8g2.drawStr((128 - u8g2.getUTF8Width(t.peer_name)) / 2, 63, t.peer_name);
                     }
-
-                    // Main screen
-                    // layout: y=14 title | y=30 artist | y=46 album
-                    //         y=49-56 seekbar | y=63 time
-                    u8g2.setFont(u8g2_font_unifont_t_japanese3);
-                    drawScrollUTF8(t.title[0]  ? t.title  : "No Information", 14, t.scroll_reset, u8g2.getUTF8Width(t.title[0]  ? t.title  : "No Information"));
-                    drawScrollUTF8(t.artist[0] ? t.artist : "",         30, t.scroll_reset, u8g2.getUTF8Width(t.artist[0] ? t.artist : ""));
-                    drawScrollUTF8(t.album[0]  ? t.album  : "",         46, t.scroll_reset, u8g2.getUTF8Width(t.album[0]  ? t.album  : ""));
-                    
-                    // Interpolate position
-                    uint32_t pos = t.position_ms;
-                    if (t.playing && t.position_ts > 0)
-                        pos += (now - t.position_ts);
-                    if (t.duration_ms > 0 && pos > t.duration_ms)
-                        pos = t.duration_ms;
-
-                    // Seekbar
-                    u8g2.drawFrame(0, 49, 128, 7);
-                    if (t.duration_ms > 0) {
-                        int fill = (int)(128ULL * pos / t.duration_ms);
-                        if (fill > 0) u8g2.drawBox(0, 49, fill, 7);
-                    }
-
-                    // Time
-                    char pos_str[8], dur_str[8];
-                    formatTime(pos, pos_str);
-                    formatTime(t.duration_ms, dur_str);
-                    u8g2.setFont(u8g2_font_5x7_tf);
-                    u8g2.drawStr(0, 63, pos_str);
-                    u8g2.drawStr(128 - u8g2.getStrWidth(dur_str), 63, dur_str);
-
-                    // peer name
-                    u8g2.setFont(u8g2_font_squeezed_r6_tr);
-                    u8g2.drawStr((128 - u8g2.getUTF8Width(t.peer_name)) / 2, 63, t.peer_name);
                 }
+                break;
             }
-
-        } else if (screen_mode == SCREEN_FFT) {
-            u8g2.clearBuffer();
-            u8g2.setFont(u8g2_font_5x7_tf);
-            u8g2.drawStr(0, 7, "FFT");
-            draw_fft();
-        } else if (screen_mode == SCREEN_WAVE) {
-            u8g2.clearBuffer();
-            u8g2.setFont(u8g2_font_5x7_tf);
-            u8g2.drawStr(0, 7, "WAVE");
-            draw_waveform();
+            case SCREEN_FFT: {
+                u8g2.clearBuffer();
+                u8g2.setFont(u8g2_font_5x7_tf);
+                u8g2.drawStr(0, 7, "FFT");
+                draw_fft();
+                break;
+            }
+            case SCREEN_WAVE: {
+                u8g2.clearBuffer();
+                u8g2.setFont(u8g2_font_5x7_tf);
+                u8g2.drawStr(0, 7, "WAVE");
+                draw_waveform();
+                break;
+            }
+            default:
+                break;
         } 
 
         u8g2.sendBuffer();
@@ -649,7 +657,8 @@ void display_task(void *param) {
 // --- Save Helper ---
 void save_state() {
     prefs.begin("settings", false);
-    prefs.putInt("input_mode", (int)input_mode);
+    InputMode save_input_mode = input_mode == MODE_BT ? MODE_LINE : MODE_BT;
+    prefs.putInt("input_mode", (int)save_input_mode);
     prefs.end();
 }
 
@@ -687,16 +696,16 @@ void handle_buttons() {
     } else if (!play_btn && play_held) {
         play_held = false;
         if (!play_long_fired && now - play_press_ms >= DEBOUNCE_MS)  {
-            if (input_mode = MODE_LINE) {
-                bool val = digitalRead(PIN_LINE_MODE);
-                digitalWrite(PIN_LINE_MODE, !val);
-                strcpy(bottom_text, val ? "Muted" : "Line Input Mode");
-            }
-            else {
+            if (input_mode == MODE_BT) {
                 xSemaphoreTake(track_mutex, portMAX_DELAY);
                 bool is_playing = track.playing;
                 xSemaphoreGive(track_mutex);
                 is_playing ? a2dp_sink.pause() : a2dp_sink.play();
+            }
+            else if (input_mode == MODE_LINE) {
+                bool val = digitalRead(PIN_LINE_MODE);
+                digitalWrite(PIN_LINE_MODE, !val);
+                strcpy(bottom_text, val ? "Muted" : "Line Input Mode");
             }
         }
         play_long_fired = false;
@@ -713,15 +722,16 @@ void handle_buttons() {
             strcpy(bottom_text, "Loading . . .");
             screen_mode = SCREEN_MAIN;
             digitalWrite(PIN_LED, LOW);
+            save_state();
             if (input_mode == MODE_BT) {
                 enqueue_chime("/disconnect.mp3");
                 bt_shutdown_pending = true;
                 while (bt_ready) vTaskDelay(10);
-                input_mode   = MODE_LINE;
-            } else {
+                input_mode = MODE_LINE;
+            } else if (input_mode == MODE_LINE) {
                 input_mode = MODE_BT;
             }
-            save_state();
+            mode_switching = true;
         }
     } else if (!mode_btn && mode_held) {
         mode_held = false;
@@ -763,6 +773,59 @@ void handle_buttons() {
             if (input_mode == MODE_BT) a2dp_sink.next();
         next_long_fired = false;
     }
+}
+
+void handle_mode_switching() {
+    if (input_mode == MODE_BT && mode_switching) {
+        auto_reconnect_enabled = true;
+        stop_adc_pending = true;
+        Serial.println("Starting BT Mode");
+        while (!adc_stopped) vTaskDelay(10); // wait for core 0 to cleanly stop ADC
+        adc_stopped = false;
+        digitalWrite(PIN_LINE_MODE, LOW);
+
+        gif_open("/connecting.raw", 11, 8);
+        Serial.printf("[BT] before i2s.begin | Heap: %u MaxAlloc: %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        vTaskDelay(pdMS_TO_TICKS(50));
+        auto cfg = i2s.defaultConfig();
+        cfg.pin_bck  = 18;
+        cfg.pin_ws   = 23;
+        cfg.pin_data = 19;
+        i2s.begin(cfg);
+        
+        Serial.printf("[BT] before a2dp start | Heap: %u MaxAlloc: %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        a2dp_sink.set_task_priority(configMAX_PRIORITIES - 5);
+        a2dp_sink.set_task_core(0);
+        a2dp_sink.set_stream_reader(read_data_stream, false);
+        a2dp_sink.set_on_connection_state_changed(bt_connection_changed);
+        a2dp_sink.set_avrc_metadata_attribute_mask(
+            ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST |
+            ESP_AVRC_MD_ATTR_ALBUM | ESP_AVRC_MD_ATTR_PLAYING_TIME
+        );
+        a2dp_sink.set_avrc_metadata_callback(avrc_metadata_callback);
+        a2dp_sink.set_avrc_rn_playstatus_callback(avrc_playstatus_callback);
+        a2dp_sink.set_avrc_rn_play_pos_callback(avrc_position_callback, 1); // 1s interval
+        // a2dp_sink.set_auto_reconnect(true);
+        a2dp_sink.start(DEVICE_NAME);
+        enqueue_chime("/on.mp3");
+        strcpy(bottom_text, "Waiting for Connection...");
+        Serial.printf("[BT] after a2dp start | Heap: %u MaxAlloc: %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        bt_ready = true;
+        Serial.printf("[BT] after bt_ready | Heap: %u MaxAlloc: %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        // dump_heap();
+        // dump_heap_blocks();
+    }
+
+    else if (input_mode == MODE_LINE && mode_switching) {
+        start_adc_pending = true;
+        stop_adc_pending = false;
+        Serial.println("Starting Line Mode");
+        gif_open("/line_in.raw", 2, 2);
+        digitalWrite(PIN_LINE_MODE, HIGH);
+        strcpy(bottom_text, "Line Input Mode");
+    }
+    mode_switching = false;
 }
 
 void dump_heap_blocks() {
@@ -821,55 +884,6 @@ void setup() {
 
 void loop() {
     handle_buttons();
-
-    if (input_mode == MODE_BT && last_input_mode != MODE_BT) {
-        auto_reconnect_enabled = true;
-        stop_adc_pending = true;
-        Serial.println("Starting BT Mode");
-        while (!adc_stopped) vTaskDelay(10); // wait for core 0 to cleanly stop ADC
-        adc_stopped = false;
-        digitalWrite(PIN_LINE_MODE, LOW);
-
-        gif_open("/connecting.raw", 11, 8);
-        Serial.printf("[BT] before i2s.begin | Heap: %u MaxAlloc: %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-        vTaskDelay(pdMS_TO_TICKS(50));
-        auto cfg = i2s.defaultConfig();
-        cfg.pin_bck  = 18;
-        cfg.pin_ws   = 23;
-        cfg.pin_data = 19;
-        i2s.begin(cfg);
-        
-        Serial.printf("[BT] before a2dp start | Heap: %u MaxAlloc: %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-        a2dp_sink.set_task_priority(configMAX_PRIORITIES - 5);
-        a2dp_sink.set_task_core(0);
-        a2dp_sink.set_stream_reader(read_data_stream, false);
-        a2dp_sink.set_on_connection_state_changed(bt_connection_changed);
-        a2dp_sink.set_avrc_metadata_attribute_mask(
-            ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST |
-            ESP_AVRC_MD_ATTR_ALBUM | ESP_AVRC_MD_ATTR_PLAYING_TIME
-        );
-        a2dp_sink.set_avrc_metadata_callback(avrc_metadata_callback);
-        a2dp_sink.set_avrc_rn_playstatus_callback(avrc_playstatus_callback);
-        a2dp_sink.set_avrc_rn_play_pos_callback(avrc_position_callback, 1); // 1s interval
-        // a2dp_sink.set_auto_reconnect(true);
-        a2dp_sink.start(DEVICE_NAME);
-        enqueue_chime("/on.mp3");
-        strcpy(bottom_text, "Waiting for Connection...");
-        Serial.printf("[BT] after a2dp start | Heap: %u MaxAlloc: %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        bt_ready = true;
-        Serial.printf("[BT] after bt_ready | Heap: %u MaxAlloc: %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-        // dump_heap();
-        // dump_heap_blocks();
-    }
-
-    else if (input_mode == MODE_LINE && last_input_mode != MODE_LINE) {
-        start_adc_pending = true;
-        stop_adc_pending = false;
-        Serial.println("Starting Line Mode");
-        gif_open("/line_in.raw", 2, 2);
-        digitalWrite(PIN_LINE_MODE, HIGH);
-        strcpy(bottom_text, "Line Input Mode");
-    }
-    last_input_mode = input_mode;
+    handle_mode_switching();
+    vTaskDelay(10);
 }
