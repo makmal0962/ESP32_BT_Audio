@@ -29,7 +29,7 @@
 
 #define FFT_SAMPLES   1024
 #define AUDIO_BUF_LEN FFT_SAMPLES
-#define WAVE_ZOOM 0.3 // <1.0 = zoom in (more detail), >1.0 = zoom out
+#define WAVE_ZOOM 0.5 // <1.0 = zoom in (more detail), >1.0 = zoom out
 
 const int NYQUIST_BINS = FFT_SAMPLES / 2;
 // int binToBar[NYQUIST_BINS];          // bar index for each FFT bin (1..NYQUIST_BINS-1)
@@ -677,10 +677,12 @@ void handle_buttons() {
     } else if (play_btn && play_held) {
         if (!play_long_fired && now - play_press_ms >= 3000) {
             play_long_fired = true;
-            screen_mode = SCREEN_MAIN;
-            strcpy(bottom_text, "Disconnecting . . .");
-            a2dp_sink.disconnect();
-            strcpy(bottom_text, "Waiting for Connection...");
+            if (input_mode == MODE_BT){
+                screen_mode = SCREEN_MAIN;
+                strcpy(bottom_text, "Disconnecting . . .");
+                a2dp_sink.disconnect();
+                strcpy(bottom_text, "Waiting for Connection...");
+            }
         }
     } else if (!play_btn && play_held) {
         play_held = false;
