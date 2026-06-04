@@ -90,6 +90,7 @@ volatile bool stop_adc_pending          = false;
 volatile bool adc_stopped               = true;
 volatile bool auto_reconnect_enabled    = true;
 volatile bool line_audio_active         = false;
+volatile bool line_audio_muted          = false;
 bool          mode_switching            = true;
 
 enum InputMode { MODE_BT, MODE_LINE };
@@ -102,6 +103,13 @@ Preferences prefs;
 I2SStream i2s;
 BluetoothA2DPSink a2dp_sink(i2s);
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+uint16_t adc_buf[256];
+int16_t  lp_prev = 0;
+int reconnect_count      = 0;
+esp_bd_addr_t saved_peer = {};
+bool peer_loaded         = false;
+int blink_count          = 0;
 
 // --- GIF animation ---
 void gif_open(const char *path, uint32_t frame_count, uint32_t fps) {
@@ -260,11 +268,6 @@ void bt_connection_changed(esp_a2d_connection_state_t state, void *ptr) {
 }
 
 void core_0_loop(void *param) {
-    static int reconnect_count      = 0;
-    static esp_bd_addr_t saved_peer = {};
-    static bool peer_loaded         = false;
-    static int blink_count          = 0;
-
     for (;;) {
         // --- BT shutdown ---
         if (bt_shutdown_pending) {
@@ -334,27 +337,27 @@ void core_0_loop(void *param) {
                 adc_stopped = true; // signal loop() it's safe to proceed
                 continue;
             }
-            static uint16_t adc_buf[256];
-            static int16_t  lp_prev = 0;
-            size_t bytes_read = 0;
-            i2s_read(ADC_I2S_PORT, adc_buf, sizeof(adc_buf), &bytes_read, pdMS_TO_TICKS(10));
-            if (xSemaphoreTake(audio_mutex, 0)) {
-                for (int i = 0; i < (int)(bytes_read / 2); i++) {
-                    int16_t raw = ((int16_t)(adc_buf[i] & 0x0FFF) - 2048) << 4;
-                    adc_dc_avg += (raw - adc_dc_avg) >> 6;
-                    int16_t dc_removed = raw - (int16_t)adc_dc_avg;
+            // if (!line_audio_muted) {
+                size_t bytes_read = 0;
+                i2s_read(ADC_I2S_PORT, adc_buf, sizeof(adc_buf), &bytes_read, pdMS_TO_TICKS(10));
+                if (xSemaphoreTake(audio_mutex, 0)) {
+                    for (int i = 0; i < (int)(bytes_read / 2); i++) {
+                        int16_t raw = ((int16_t)(adc_buf[i] & 0x0FFF) - 2048) << 4;
+                        adc_dc_avg += (raw - adc_dc_avg) >> 7;
+                        int16_t dc_removed = raw - (int16_t)adc_dc_avg;
 
-                    // low-pass anti-alias
-                    int16_t filtered = (int16_t)(0.4f * dc_removed + 0.6f * lp_prev);
-                    lp_prev = filtered;
+                        // low-pass anti-alias
+                        int16_t filtered = (int16_t)(0.4f * dc_removed + 0.6f * lp_prev);
+                        lp_prev = filtered;
 
-                    int32_t val = (int32_t)filtered * 3 / 2; // gain boost
-                    val = val > INT16_MAX ? INT16_MAX : (val < INT16_MIN ? INT16_MIN : val);
-                    audio_ring[audio_ring_pos % AUDIO_BUF_LEN] = (int16_t)val;
-                    audio_ring_pos++;
+                        int32_t val = (int32_t)filtered * 3 / 2; // gain boost
+                        val = val > INT16_MAX ? INT16_MAX : (val < INT16_MIN ? INT16_MIN : val);
+                        audio_ring[audio_ring_pos % AUDIO_BUF_LEN] = (int16_t)val;
+                        audio_ring_pos++;
+                    }
+                    xSemaphoreGive(audio_mutex);
                 }
-                xSemaphoreGive(audio_mutex);
-            }
+            // }
             continue; // skip BT event handling while in line mode
         }
 
@@ -454,7 +457,7 @@ void draw_fft() {
         barBinCount[b] += 1;
     }
 
-    const float DB_FLOOR   = -60.0f;
+    const float DB_FLOOR   = (input_mode == MODE_LINE) ? -55.0f : -60.0f;
     const float FFT_REF    = 32768.0f * FFT_SAMPLES / 4.0f;
     const float NOISE_GATE = (input_mode == MODE_LINE) ? 200.0f : 0.0f;
 
@@ -468,17 +471,23 @@ void draw_fft() {
             barMag[b] = DB_FLOOR;
         }
     }
-    // gate bar 0 since it's too noisy (hardware limitations)
-    barMag[0] = (input_mode == MODE_LINE && barMag[0] < -53.0f) ? DB_FLOOR : barMag[0]; 
 
     // --- debug log ---
-    static uint32_t last_log = 0;
-    if (input_mode == MODE_LINE && millis() - last_log > 1000) {
-        last_log = millis();
-        for (int b = 0; b < NUM_BARS; b++)
-            Serial.printf("bar[%02d] mag=%6.1f bins=%d\n", b, barMag[b], barBinCount[b]);
-        Serial.println("---");
-    }
+    // static uint32_t last_log = 0;
+    // if (input_mode == MODE_LINE && millis() - last_log > 1000) {
+    //     last_log = millis();
+    //     for (int b = 0; b < NUM_BARS; b++)
+    //         Serial.printf("bar[%02d] mag=%6.1f bins=%d\n", b, barMag[b], barBinCount[b]);
+    //     Serial.println("---");
+    // }
+    // if (input_mode == MODE_LINE && millis() - last_log > 100) {
+    //     last_log = millis();
+    //     Serial.println(barMag[0]);
+    // }
+
+    // gate bar 0 because too noisy (hardware limitation)
+    barMag[0] = (input_mode == MODE_LINE && barMag[0] < -46.0f) ? DB_FLOOR : barMag[0]; 
+
 
     const int      BAR_AREA         = 54;
     const int      BAR_WIDTH        = 128 / NUM_BARS;
@@ -706,6 +715,7 @@ void handle_buttons() {
                 bool val = digitalRead(PIN_LINE_MODE);
                 digitalWrite(PIN_LINE_MODE, !val);
                 strcpy(bottom_text, val ? "Muted" : "Line Input Mode");
+                line_audio_muted = val;
             }
         }
         play_long_fired = false;
@@ -820,6 +830,7 @@ void handle_mode_switching() {
     else if (input_mode == MODE_LINE && mode_switching) {
         start_adc_pending = true;
         stop_adc_pending = false;
+        line_audio_muted = false;
         Serial.println("Starting Line Mode");
         gif_open("/line_in.raw", 2, 2);
         digitalWrite(PIN_LINE_MODE, HIGH);
