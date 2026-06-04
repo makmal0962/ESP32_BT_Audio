@@ -10,7 +10,7 @@
 #include <driver/adc.h>
 #include <driver/i2s.h>
 
-#define LED_PIN         2
+#define PIN_LED         2
 #define DEVICE_NAME     "ESP32 BT Audio"
 #define PEER_SHOW_MS    2000
 #define SCROLL_SPEED    20   // px/sec
@@ -22,7 +22,7 @@
 #define BTN_MODE 25
 #define DEBOUNCE_MS 100
 
-#define INPUT_MODE_PIN  27
+#define PIN_LINE_MODE  27
 #define ADC_PIN         35
 #define ADC_CHANNEL     ADC1_CHANNEL_7 // GPIO35
 #define ADC_I2S_PORT I2S_NUM_0 
@@ -238,7 +238,7 @@ void bt_connection_changed(esp_a2d_connection_state_t state, void *ptr) {
     bool was_connected = bt_connected;
     bt_connected = (state == ESP_A2D_CONNECTION_STATE_CONNECTED);
     if (bt_connected) {
-        digitalWrite(LED_PIN, HIGH);
+        digitalWrite(PIN_LED, HIGH);
         if (xSemaphoreTake(track_mutex, pdMS_TO_TICKS(100))) {
             track.show_peer  = true;
             track.peer_until = millis() + PEER_SHOW_MS + 2000;
@@ -295,7 +295,6 @@ void core_0_loop(void *param) {
             gpio_reset_pin((gpio_num_t)19);
 
             Serial.println("Starting ADC");
-            adc_dc_avg = 0;
             i2s_config_t i2s_cfg = {
                 .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN),
                 .sample_rate          = 44100,
@@ -316,6 +315,7 @@ void core_0_loop(void *param) {
             xSemaphoreTake(audio_mutex, portMAX_DELAY);
             memset(audio_ring, 0, sizeof(audio_ring));
             audio_ring_pos = 0;
+            adc_dc_avg = 0;
             xSemaphoreGive(audio_mutex);
             line_audio_active = true;
         }
@@ -335,15 +335,22 @@ void core_0_loop(void *param) {
                 continue;
             }
             static uint16_t adc_buf[256];
+            static int16_t  lp_prev = 0;
             size_t bytes_read = 0;
             i2s_read(ADC_I2S_PORT, adc_buf, sizeof(adc_buf), &bytes_read, pdMS_TO_TICKS(10));
-            // if (!line_audio_active) { vTaskDelay(5); continue; }
-            // if (bytes_read > 0) Serial.printf("[ADC] raw[0]: %u masked: %u\n", adc_buf[0], adc_buf[0] & 0x0FFF);
             if (xSemaphoreTake(audio_mutex, 0)) {
                 for (int i = 0; i < (int)(bytes_read / 2); i++) {
                     int16_t raw = ((int16_t)(adc_buf[i] & 0x0FFF) - 2048) << 4;
-                    adc_dc_avg += (raw - adc_dc_avg) >> 8; // track DC
-                    audio_ring[audio_ring_pos % AUDIO_BUF_LEN] = raw - (int16_t)adc_dc_avg;
+                    adc_dc_avg += (raw - adc_dc_avg) >> 6;
+                    int16_t dc_removed = raw - (int16_t)adc_dc_avg;
+
+                    // low-pass anti-alias
+                    int16_t filtered = (int16_t)(0.4f * dc_removed + 0.6f * lp_prev);
+                    lp_prev = filtered;
+
+                    int32_t val = (int32_t)filtered * 3 / 2; // gain boost
+                    val = val > INT16_MAX ? INT16_MAX : (val < INT16_MIN ? INT16_MIN : val);
+                    audio_ring[audio_ring_pos % AUDIO_BUF_LEN] = (int16_t)val;
                     audio_ring_pos++;
                 }
                 xSemaphoreGive(audio_mutex);
@@ -378,9 +385,9 @@ void core_0_loop(void *param) {
                 blink_count++;
             }
 
-            digitalWrite(LED_PIN, HIGH);
+            digitalWrite(PIN_LED, HIGH);
             vTaskDelay(pdMS_TO_TICKS(500));
-            if (!bt_connected) digitalWrite(LED_PIN, LOW);
+            if (!bt_connected) digitalWrite(PIN_LED, LOW);
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
@@ -402,7 +409,7 @@ void core_0_loop(void *param) {
             if (addr) bt_save_peer(*addr);
         }
 
-        vTaskDelay(5);
+        vTaskDelay(2);
     }
 }
 
@@ -442,42 +449,52 @@ void draw_fft() {
     float barMag[NUM_BARS]      = {};
 
     for (int k = 1; k < NYQUIST_BINS; k++) {
-        int b = (int8_t)pgm_read_byte(&binToBar[k - 1]); 
+        int b = (int8_t)pgm_read_byte(&binToBar[k - 1]);
         barMag[b]      += fft_real[k];
         barBinCount[b] += 1;
     }
 
-    const float DB_FLOOR = -60.0f;
-    const float FFT_REF  = 32768.0f * FFT_SAMPLES / 4.0f;
+    const float DB_FLOOR   = -60.0f;
+    const float FFT_REF    = 32768.0f * FFT_SAMPLES / 4.0f;
+    const float NOISE_GATE = (input_mode == MODE_LINE) ? 200.0f : 0.0f;
 
     for (int b = 0; b < NUM_BARS; b++) {
         if (barBinCount[b] > 0) {
             barMag[b] /= barBinCount[b];
-            // single log — convert linear magnitude to dBFS
+            if (barMag[b] < NOISE_GATE) barMag[b] = 0;
             barMag[b] = barMag[b] > 0 ? 20.0f * log10f(barMag[b] / FFT_REF) : DB_FLOOR;
             barMag[b] = barMag[b] < DB_FLOOR ? DB_FLOOR : barMag[b];
         } else {
             barMag[b] = DB_FLOOR;
         }
     }
+    // gate bar 0 since it's too noisy (hardware limitations)
+    barMag[0] = (input_mode == MODE_LINE && barMag[0] < -53.0f) ? DB_FLOOR : barMag[0]; 
 
-    const int BAR_DECAY        = 2;
+    // --- debug log ---
+    static uint32_t last_log = 0;
+    if (input_mode == MODE_LINE && millis() - last_log > 1000) {
+        last_log = millis();
+        for (int b = 0; b < NUM_BARS; b++)
+            Serial.printf("bar[%02d] mag=%6.1f bins=%d\n", b, barMag[b], barBinCount[b]);
+        Serial.println("---");
+    }
+
+    const int      BAR_AREA         = 54;
+    const int      BAR_WIDTH        = 128 / NUM_BARS;
+    const int      START_X          = (128 - NUM_BARS * BAR_WIDTH) / 2;
+    const int      BAR_DECAY        = 2;
+    const int      PEAK_BAR_DECAY   = 1;
     const uint32_t PEAK_BAR_HOLD_MS = 750;
-    const int PEAK_BAR_DECAY   = 1;
-    const int BAR_AREA  = 54;
-    const int BAR_WIDTH = 128 / NUM_BARS;
-    const int START_X   = (128 - NUM_BARS * BAR_WIDTH) / 2;
     uint32_t now_ms = millis();
 
     for (int b = 0; b < NUM_BARS; b++) {
-        // barMag[b] is already dBFS — use directly
-        float db = barMag[b];
-        float normalized = (db - DB_FLOOR) / (0.0f - DB_FLOOR);
+        float normalized = (barMag[b] - DB_FLOOR) / (0.0f - DB_FLOOR);
         normalized = normalized < 0.0f ? 0.0f : (normalized > 1.0f ? 1.0f : normalized);
         int target = (int)(normalized * BAR_AREA);
 
         if (target >= barHeight[b]) barHeight[b] = target;
-        else barHeight[b] -= BAR_DECAY;
+        else                        barHeight[b] -= BAR_DECAY;
         if (barHeight[b] < 0) barHeight[b] = 0;
 
         if (target >= barPeakHold[b]) {
@@ -531,7 +548,7 @@ void display_task(void *param) {
         if (screen_mode == SCREEN_MAIN) {
             if (!bt_connected || input_mode == MODE_LINE) {
                 // animation screen
-                gif_next_frame();
+                if (input_mode == MODE_BT || digitalRead(PIN_LINE_MODE)) gif_next_frame();
                 uint8_t *buf = u8g2.getBufferPtr();
                 memcpy(buf, gif.frame_buf, 768);   // pages 0-5: gif (128x48)
                 memset(buf + 768, 0, 256);         // pages 6-7: clear for text row
@@ -668,10 +685,17 @@ void handle_buttons() {
     } else if (!play_btn && play_held) {
         play_held = false;
         if (!play_long_fired && now - play_press_ms >= DEBOUNCE_MS)  {
-            xSemaphoreTake(track_mutex, portMAX_DELAY);
-            bool is_playing = track.playing;
-            xSemaphoreGive(track_mutex);
-            is_playing ? a2dp_sink.pause() : a2dp_sink.play();
+            if (input_mode = MODE_LINE) {
+                bool val = digitalRead(PIN_LINE_MODE);
+                digitalWrite(PIN_LINE_MODE, !val);
+                strcpy(bottom_text, val ? "Muted" : "Line Input Mode");
+            }
+            else {
+                xSemaphoreTake(track_mutex, portMAX_DELAY);
+                bool is_playing = track.playing;
+                xSemaphoreGive(track_mutex);
+                is_playing ? a2dp_sink.pause() : a2dp_sink.play();
+            }
         }
         play_long_fired = false;
     }
@@ -686,6 +710,7 @@ void handle_buttons() {
             mode_long_fired = true;
             strcpy(bottom_text, "Loading . . .");
             screen_mode = SCREEN_MAIN;
+            digitalWrite(PIN_LED, LOW);
             if (input_mode == MODE_BT) {
                 enqueue_chime("/disconnect.mp3");
                 bt_shutdown_pending = true;
@@ -716,7 +741,7 @@ void handle_buttons() {
     } else if (!prev_btn && prev_held) {
         prev_held = false;
         if (!prev_long_fired && now - prev_press_ms >= DEBOUNCE_MS)
-            a2dp_sink.previous();
+            if (input_mode == MODE_BT) a2dp_sink.previous();
         prev_long_fired = false;
     }
 
@@ -733,7 +758,7 @@ void handle_buttons() {
     } else if (!next_btn && next_held) {
         next_held = false;
         if (!next_long_fired && now - next_press_ms >= DEBOUNCE_MS)
-            a2dp_sink.next();
+            if (input_mode == MODE_BT) a2dp_sink.next();
         next_long_fired = false;
     }
 }
@@ -766,9 +791,8 @@ void setup() {
     Serial.printf("Starting ESP32. MaxAlloc: %u\n", ESP.getMaxAllocHeap());
     // dump_heap();
     // dump_heap_blocks();
-    pinMode(LED_PIN, OUTPUT);
-    pinMode(INPUT_MODE_PIN, OUTPUT);
-    digitalWrite(INPUT_MODE_PIN, LOW);
+    pinMode(PIN_LED, OUTPUT);
+    pinMode(PIN_LINE_MODE, OUTPUT);
     pinMode(BTN_PLAY, INPUT_PULLUP);
     pinMode(BTN_PREV, INPUT_PULLUP);
     pinMode(BTN_NEXT, INPUT_PULLUP);
@@ -802,6 +826,7 @@ void loop() {
         Serial.println("Starting BT Mode");
         while (!adc_stopped) vTaskDelay(10); // wait for core 0 to cleanly stop ADC
         adc_stopped = false;
+        digitalWrite(PIN_LINE_MODE, LOW);
 
         gif_open("/connecting.raw", 11, 8);
         Serial.printf("[BT] before i2s.begin | Heap: %u MaxAlloc: %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
@@ -841,7 +866,7 @@ void loop() {
         stop_adc_pending = false;
         Serial.println("Starting Line Mode");
         gif_open("/line_in.raw", 2, 2);
-        digitalWrite(INPUT_MODE_PIN, HIGH);
+        digitalWrite(PIN_LINE_MODE, HIGH);
         strcpy(bottom_text, "Line Input Mode");
     }
     last_input_mode = input_mode;
