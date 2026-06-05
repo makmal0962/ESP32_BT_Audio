@@ -29,7 +29,7 @@
 
 #define FFT_SAMPLES   1024
 #define AUDIO_BUF_LEN FFT_SAMPLES
-#define WAVE_ZOOM 0.5 // <1.0 = zoom in (more detail), >1.0 = zoom out
+#define WAVE_ZOOM 0.35 // <1.0 = zoom in (more detail), >1.0 = zoom out
 
 const int NYQUIST_BINS = FFT_SAMPLES / 2;
 // int binToBar[NYQUIST_BINS];          // bar index for each FFT bin (1..NYQUIST_BINS-1)
@@ -271,12 +271,19 @@ void core_0_loop(void *param) {
     for (;;) {
         // --- BT shutdown ---
         if (bt_shutdown_pending) {
-            auto_reconnect_enabled = true;
+            auto_reconnect_enabled = false;
             peer_loaded     = false;
             reconnect_count = 0;
             blink_count     = 0;
             bt_shutdown_pending = false;
-            // if (bt_connected) enqueue_chime("/disconnect.mp3");
+            
+            // esp_a2d_connection_state_t state = a2dp_sink.get_connection_state();
+            // if (state == ESP_A2D_CONNECTION_STATE_CONNECTING ||
+            //     state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+            //     a2dp_sink.disconnect();
+            //     vTaskDelay(pdMS_TO_TICKS(200));
+            // }
+
             Serial.printf("[SHUTDOWN] before end | Heap: %u\n", ESP.getFreeHeap());
             a2dp_sink.end(false);
             bt_ready = false;
@@ -305,8 +312,8 @@ void core_0_loop(void *param) {
                 .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
                 .communication_format = I2S_COMM_FORMAT_STAND_I2S,
                 .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
-                .dma_buf_count        = 4,
-                .dma_buf_len          = 256,
+                .dma_buf_count        = 2,
+                .dma_buf_len          = 128,
                 .use_apll             = false,
             };
             i2s_driver_install(ADC_I2S_PORT, &i2s_cfg, 0, NULL);
@@ -437,7 +444,7 @@ void drawScrollUTF8(const char *text, int y, uint32_t scroll_start, int tw) {
 
 void draw_fft() {
     xSemaphoreTake(audio_mutex, portMAX_DELAY);
-    uint32_t start = audio_ring_pos;
+    uint32_t start = audio_ring_pos - FFT_SAMPLES;
     for (int i = 0; i < FFT_SAMPLES; i++) {
         fft_real[i] = (float)audio_ring[(start + i) % AUDIO_BUF_LEN];
         fft_imag[i] = 0;
@@ -457,7 +464,7 @@ void draw_fft() {
         barBinCount[b] += 1;
     }
 
-    const float DB_FLOOR   = (input_mode == MODE_LINE) ? -55.0f : -60.0f;
+    const float DB_FLOOR   = -60.0f;
     const float FFT_REF    = 32768.0f * FFT_SAMPLES / 4.0f;
     const float NOISE_GATE = (input_mode == MODE_LINE) ? 200.0f : 0.0f;
 
@@ -485,7 +492,7 @@ void draw_fft() {
     //     Serial.println(barMag[0]);
     // }
 
-    // gate bar 0 because too noisy (hardware limitation)
+    // more gate to bar 0 because too noisy (hardware limitation)
     barMag[0] = (input_mode == MODE_LINE && barMag[0] < -46.0f) ? DB_FLOOR : barMag[0]; 
 
 
@@ -537,9 +544,10 @@ void draw_waveform() {
     const int MID    = (TOP + BOTTOM) / 2;
     const int HALF   = (BOTTOM - TOP) / 2;
     const float REF  = 32768.0f; // fixed full-scale reference
+    const int gain = (input_mode == MODE_LINE) ? 2 : 1;
 
     for (int x = 0; x < 128; x++) {
-        int y = MID - (int)(snapshot[x] / REF * HALF);
+        int y = MID - (int)((snapshot[x] / REF * HALF) * gain);
         y = constrain(y, TOP, BOTTOM);
         u8g2.drawPixel(x, y);
     }
@@ -734,7 +742,7 @@ void handle_buttons() {
             digitalWrite(PIN_LED, LOW);
             save_state();
             if (input_mode == MODE_BT) {
-                enqueue_chime("/disconnect.mp3");
+                if (bt_connected) enqueue_chime("/disconnect.mp3");
                 bt_shutdown_pending = true;
                 while (bt_ready) vTaskDelay(10);
                 input_mode = MODE_LINE;
@@ -820,7 +828,7 @@ void handle_mode_switching() {
         enqueue_chime("/on.mp3");
         strcpy(bottom_text, "Waiting for Connection...");
         Serial.printf("[BT] after a2dp start | Heap: %u MaxAlloc: %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(500));
         bt_ready = true;
         Serial.printf("[BT] after bt_ready | Heap: %u MaxAlloc: %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
         // dump_heap();
