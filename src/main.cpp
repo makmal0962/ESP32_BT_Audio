@@ -154,6 +154,10 @@ void chime_task(void *param) {
     const char *path;
     for (;;) {
         if (xQueueReceive(chime_queue, &path, portMAX_DELAY)) {
+            if (input_mode == MODE_LINE) {
+                vTaskDelay(10);
+                continue;
+            }
             Serial.printf("Chime: %s, MaxAlloc: %u\n", path, ESP.getMaxAllocHeap());
             if (ESP.getMaxAllocHeap() < 18000) Serial.println("[W] Chime: Heap too low, waiting");
             uint32_t timeout = millis() + 5000;
@@ -163,7 +167,7 @@ void chime_task(void *param) {
                 play_chime_mp3(path);
             }
             else {
-                Serial.println("[E] Chime: Skipped, heap too low/too much fragmentation!");
+                Serial.println("[E] Chime: Skipped, heap too low/fragmented!");
             }
             chime_blocking = false;
         }
@@ -745,6 +749,7 @@ void handle_buttons() {
                 if (bt_connected) enqueue_chime("/disconnect.mp3");
                 bt_shutdown_pending = true;
                 while (bt_ready) vTaskDelay(10);
+                xQueueReset(chime_queue);
                 input_mode = MODE_LINE;
             } else if (input_mode == MODE_LINE) {
                 input_mode = MODE_BT;
