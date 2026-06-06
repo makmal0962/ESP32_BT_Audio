@@ -10,6 +10,10 @@
 #include <driver/adc.h>
 #include <driver/i2s.h>
 
+// #include "unifont_custom.c"
+// #define U8G2_USE_LARGE_FONTS
+// extern const uint8_t unifont_custom[] U8G2_FONT_SECTION("unifont_custom");
+
 #define PIN_LED         2
 #define DEVICE_NAME     "ESP32 BT Audio"
 #define PEER_SHOW_MS    2000
@@ -20,11 +24,11 @@
 #define BTN_PREV 16
 #define BTN_NEXT 17
 #define BTN_MODE 25
-#define DEBOUNCE_MS 100
+#define DEBOUNCE_MS 50
 
 #define PIN_LINE_MODE  27
-#define ADC_PIN         35
-#define ADC_CHANNEL     ADC1_CHANNEL_7 // GPIO35
+#define ADC_PIN        35
+#define ADC_CHANNEL    ADC1_CHANNEL_7 // GPIO35
 #define ADC_I2S_PORT I2S_NUM_0 
 
 #define FFT_SAMPLES   1024
@@ -32,13 +36,14 @@
 #define WAVE_ZOOM 0.35 // <1.0 = zoom in (more detail), >1.0 = zoom out
 
 const int NYQUIST_BINS = FFT_SAMPLES / 2;
-// int binToBar[NYQUIST_BINS];          // bar index for each FFT bin (1..NYQUIST_BINS-1)
 const float SAMPLE_RATE = 44100.0;
 const int NUM_BARS = 16;
 
 float fft_real[FFT_SAMPLES];
 float fft_imag[FFT_SAMPLES];
 int16_t audio_ring[AUDIO_BUF_LEN];
+
+float wave_gain = 1.0f;
 
 struct TrackInfo {
     char     title[128];
@@ -280,13 +285,6 @@ void core_0_loop(void *param) {
             reconnect_count = 0;
             blink_count     = 0;
             bt_shutdown_pending = false;
-            
-            // esp_a2d_connection_state_t state = a2dp_sink.get_connection_state();
-            // if (state == ESP_A2D_CONNECTION_STATE_CONNECTING ||
-            //     state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
-            //     a2dp_sink.disconnect();
-            //     vTaskDelay(pdMS_TO_TICKS(200));
-            // }
 
             Serial.printf("[SHUTDOWN] before end | Heap: %u\n", ESP.getFreeHeap());
             a2dp_sink.end(false);
@@ -430,7 +428,13 @@ void core_0_loop(void *param) {
 // --- Display helpers ---
 void formatTime(uint32_t ms, char *buf) {
     uint32_t s = ms / 1000;
-    sprintf(buf, "%u:%02u", s / 60, s % 60);
+    uint32_t h = s / 3600;
+    uint32_t m = (s % 3600) / 60;
+    uint32_t sec = s % 60;
+    if (h > 0)
+        snprintf(buf, 10, "%u:%02u:%02u", h, m, sec);
+    else
+        snprintf(buf, 10, "%u:%02u", m, sec);
 }
 
 // scrolling UTF8 text — clipped to 128px width
@@ -548,10 +552,9 @@ void draw_waveform() {
     const int MID    = (TOP + BOTTOM) / 2;
     const int HALF   = (BOTTOM - TOP) / 2;
     const float REF  = 32768.0f; // fixed full-scale reference
-    const int gain = (input_mode == MODE_LINE) ? 2 : 1;
 
     for (int x = 0; x < 128; x++) {
-        int y = MID - (int)((snapshot[x] / REF * HALF) * gain);
+        int y = MID - (int)((snapshot[x] / REF * HALF) * wave_gain);
         y = constrain(y, TOP, BOTTOM);
         u8g2.drawPixel(x, y);
     }
@@ -601,7 +604,7 @@ void display_task(void *param) {
 
                         // Main screen
                         // layout: y=14 title | y=30 artist | y=46 album
-                        //         y=49-56 seekbar | y=63 time
+                        //         y=49-56 seekbar | y=63 time & peer name
                         u8g2.setFont(u8g2_font_unifont_t_japanese3);
                         drawScrollUTF8(t.title[0]  ? t.title  : "No Information", 14, t.scroll_reset, u8g2.getUTF8Width(t.title[0]  ? t.title  : "No Information"));
                         drawScrollUTF8(t.artist[0] ? t.artist : "",         30, t.scroll_reset, u8g2.getUTF8Width(t.artist[0] ? t.artist : ""));
@@ -622,7 +625,7 @@ void display_task(void *param) {
                         }
 
                         // Time
-                        char pos_str[8], dur_str[8];
+                        char pos_str[10], dur_str[10];
                         formatTime(pos, pos_str);
                         formatTime(t.duration_ms, dur_str);
                         u8g2.setFont(u8g2_font_5x7_tf);
@@ -646,7 +649,10 @@ void display_task(void *param) {
             case SCREEN_WAVE: {
                 u8g2.clearBuffer();
                 u8g2.setFont(u8g2_font_5x7_tf);
-                u8g2.drawStr(0, 7, "WAVE");
+                char gain_str[16];
+                if (wave_gain > 1.0f) snprintf(gain_str, sizeof(gain_str), "WAVE x%.2f", wave_gain);
+                else snprintf (gain_str, sizeof(gain_str), "WAVE");
+                u8g2.drawStr(0, 7, gain_str);
                 draw_waveform();
                 break;
             }
@@ -655,6 +661,7 @@ void display_task(void *param) {
         } 
 
         u8g2.sendBuffer();
+
         // static uint32_t fps_last = 0;
         // static uint32_t fps_count = 0;
         // fps_count++;
@@ -663,12 +670,6 @@ void display_task(void *param) {
         //     fps_count = 0;
         //     fps_last = millis();
         // }
-        // static uint32_t heap_last = 0;
-        // if (millis() - heap_last >= 1000) {
-        //     Serial.printf("[loop] Heap: %u\n", ESP.getFreeHeap());
-        //     Serial.printf("[loop] Max alloc Heap: %u\n", ESP.getMaxAllocHeap());
-        //     heap_last = millis();
-        // };
 
         vTaskDelay(1);
     }
@@ -693,10 +694,10 @@ void handle_buttons() {
     static bool     mode_held      = false;
     static bool     prev_held      = false;
     static bool     next_held      = false;
-    static bool play_long_fired = false;
-    static bool mode_long_fired = false;
-    static bool prev_long_fired = false;
-    static bool next_long_fired = false;
+    static bool     play_long_fired = false;
+    static bool     mode_long_fired = false;
+    static bool     prev_long_fired = false;
+    static bool     next_long_fired = false;
     uint32_t now = millis();
 
     bool play_btn = !digitalRead(BTN_PLAY);
@@ -776,7 +777,12 @@ void handle_buttons() {
     } else if (!prev_btn && prev_held) {
         prev_held = false;
         if (!prev_long_fired && now - prev_press_ms >= DEBOUNCE_MS)
-            if (input_mode == MODE_BT) a2dp_sink.previous();
+            if (screen_mode == SCREEN_WAVE) {
+                wave_gain -= 0.25f;
+                if (wave_gain < 1.0f) wave_gain = 2.0f;
+            } else {
+                if (input_mode == MODE_BT) a2dp_sink.previous();
+            }
         prev_long_fired = false;
     }
 
@@ -793,7 +799,12 @@ void handle_buttons() {
     } else if (!next_btn && next_held) {
         next_held = false;
         if (!next_long_fired && now - next_press_ms >= DEBOUNCE_MS)
-            if (input_mode == MODE_BT) a2dp_sink.next();
+            if (screen_mode == SCREEN_WAVE) {
+                wave_gain += 0.25f;
+                if (wave_gain > 2.0f) wave_gain = 1.0f;
+            } else {
+                if (input_mode == MODE_BT) a2dp_sink.next();
+            }
         next_long_fired = false;
     }
 }
@@ -898,8 +909,6 @@ void setup() {
 
     gif_open("/connecting.raw", 11, 8);
     strcpy(bottom_text, "Loading . . .");
-    // setupFrequencyMapping();
-
 
     prefs.begin("settings", true);
     input_mode  = (InputMode)prefs.getInt("input_mode",  MODE_BT);
@@ -909,5 +918,13 @@ void setup() {
 void loop() {
     handle_buttons();
     handle_mode_switching();
+
+    // static uint32_t heap_last = 0;
+    // if (millis() - heap_last >= 1000) {
+    //     Serial.printf("[loop] Heap: %u\n", ESP.getFreeHeap());
+    //     Serial.printf("[loop] Max alloc Heap: %u\n", ESP.getMaxAllocHeap());
+    //     heap_last = millis();
+    // };
+    
     vTaskDelay(10);
 }

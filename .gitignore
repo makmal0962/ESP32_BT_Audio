@@ -3,3 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+font/unifont-13.0.06.bdf
+font/bdfconv.exe
+src/unifont_custom.c
+bdf.tga
