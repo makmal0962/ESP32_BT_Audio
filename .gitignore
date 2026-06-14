@@ -6,4 +6,5 @@
 font/unifont-13.0.06.bdf
 font/bdfconv.exe
 src/unifont_custom.c
+src/bintobar_generated.h
 bdf.tga

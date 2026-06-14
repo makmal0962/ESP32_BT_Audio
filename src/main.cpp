@@ -26,6 +26,10 @@
 #define BTN_MODE 25
 #define DEBOUNCE_MS 50
 
+#define DAC_BCK     18
+#define DAC_DATA    19
+#define DAC_WS      23
+
 #define PIN_LINE_MODE  27
 #define ADC_PIN        35
 #define ADC_CHANNEL    ADC1_CHANNEL_7 // GPIO35
@@ -302,9 +306,9 @@ void core_0_loop(void *param) {
             Serial.println("Stopping I2S");
             i2s.end();
 
-            gpio_reset_pin((gpio_num_t)18);
-            gpio_reset_pin((gpio_num_t)23);
-            gpio_reset_pin((gpio_num_t)19);
+            gpio_reset_pin((gpio_num_t)DAC_BCK);
+            gpio_reset_pin((gpio_num_t)DAC_DATA);
+            gpio_reset_pin((gpio_num_t)DAC_WS);
 
             Serial.println("Starting ADC");
             i2s_config_t i2s_cfg = {
@@ -437,7 +441,7 @@ void formatTime(uint32_t ms, char *buf) {
         snprintf(buf, 10, "%u:%02u", m, sec);
 }
 
-// scrolling UTF8 text — clipped to 128px width
+// scrolling UTF8 text - clipped to 128px width
 void drawScrollUTF8(const char *text, int y, uint32_t scroll_start, int tw) {
     if (tw <= 128) {
         u8g2.drawUTF8(0, y, text);
@@ -578,7 +582,7 @@ void display_task(void *param) {
                     memcpy(buf, gif.frame_buf, 768);   // pages 0-5: gif (128x48)
                     memset(buf + 768, 0, 256);         // pages 6-7: clear for text row
 
-                    // device name overlay at bottom
+                    // text below animation
                     u8g2.setFont(u8g2_font_tallpixelextended_tr);
                     u8g2.drawUTF8((128 - u8g2.getUTF8Width(bottom_text)) / 2, 60, bottom_text);
                 } else {
@@ -589,7 +593,7 @@ void display_task(void *param) {
                     xSemaphoreGive(track_mutex);
 
                     if (t.show_peer && now < t.peer_until) {
-                        // Connected — briefly show peer name
+                        // Connected - briefly show peer name
                         u8g2.setFont(u8g2_font_tallpixelextended_tr);
                         int lw = u8g2.getUTF8Width("Connected to:");
                         u8g2.drawUTF8((128 - lw) / 2, 24, "Connected to:");
@@ -810,7 +814,9 @@ void handle_buttons() {
 }
 
 void handle_mode_switching() {
-    if (input_mode == MODE_BT && mode_switching) {
+    if (!mode_switching) return;
+    mode_switching = false;
+    if (input_mode == MODE_BT) {
         auto_reconnect_enabled = true;
         stop_adc_pending = true;
         Serial.println("Starting BT Mode");
@@ -822,9 +828,9 @@ void handle_mode_switching() {
         Serial.printf("[BT] before i2s.begin | Heap: %u MaxAlloc: %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
         vTaskDelay(pdMS_TO_TICKS(50));
         auto cfg = i2s.defaultConfig();
-        cfg.pin_bck  = 18;
-        cfg.pin_ws   = 23;
-        cfg.pin_data = 19;
+        cfg.pin_bck  = DAC_BCK;
+        cfg.pin_ws   = DAC_WS;
+        cfg.pin_data = DAC_DATA;
         i2s.begin(cfg);
         
         Serial.printf("[BT] before a2dp start | Heap: %u MaxAlloc: %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
@@ -851,7 +857,7 @@ void handle_mode_switching() {
         // dump_heap_blocks();
     }
 
-    else if (input_mode == MODE_LINE && mode_switching) {
+    else if (input_mode == MODE_LINE) {
         start_adc_pending = true;
         stop_adc_pending = false;
         line_audio_muted = false;
@@ -860,7 +866,6 @@ void handle_mode_switching() {
         digitalWrite(PIN_LINE_MODE, HIGH);
         strcpy(bottom_text, "Line Input Mode");
     }
-    mode_switching = false;
 }
 
 void dump_heap_blocks() {
