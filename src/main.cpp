@@ -19,6 +19,7 @@
 #define PEER_SHOW_MS    2000
 #define SCROLL_SPEED    20   // px/sec
 #define SCROLL_GAP      64   // px between loop
+#define SCROLL_PAUSE_MS 3000
 
 #define BTN_PLAY 26
 #define BTN_PREV 16
@@ -37,7 +38,7 @@
 
 #define FFT_SAMPLES   1024
 #define AUDIO_BUF_LEN FFT_SAMPLES
-#define WAVE_ZOOM 0.35 // <1.0 = zoom in (more detail), >1.0 = zoom out
+#define WAVE_ZOOM 0.5 // <1.0 = zoom in (more detail), >1.0 = zoom out
 
 const int NYQUIST_BINS = FFT_SAMPLES / 2;
 const float SAMPLE_RATE = 44100.0;
@@ -88,19 +89,22 @@ uint32_t audio_ring_pos  = 0;
 int32_t adc_dc_avg      = 0;
 char bottom_text[64] = "";
 
-volatile bool bt_connected              = false;
-volatile bool chime_blocking            = false;
-volatile bool connect_event             = false;
-volatile bool disconnect_event          = false;
-volatile bool bt_ready                  = false;
-volatile bool bt_shutdown_pending       = false;
-volatile bool start_adc_pending         = false;
-volatile bool stop_adc_pending          = false;
-volatile bool adc_stopped               = true;
-volatile bool auto_reconnect_enabled    = true;
-volatile bool line_audio_active         = false;
-volatile bool line_audio_muted          = false;
-bool          mode_switching            = true;
+TaskHandle_t    core0_task_handle = NULL;
+SemaphoreHandle_t adc_stop_sem;
+
+#define NOTIFY_CONNECT      (1 << 0)
+#define NOTIFY_DISCONNECT   (1 << 1)
+#define NOTIFY_BT_SHUTDOWN  (1 << 2)
+#define NOTIFY_START_ADC    (1 << 3)
+#define NOTIFY_STOP_ADC     (1 << 4)
+
+volatile bool bt_connected     = false;
+volatile bool chime_blocking   = false;
+volatile bool bt_ready         = false;
+bool auto_reconnect_enabled    = true;
+bool line_audio_active         = false;
+bool line_audio_muted          = false;
+bool mode_switching            = true;
 
 enum InputMode { MODE_BT, MODE_LINE };
 volatile InputMode input_mode = MODE_BT;
@@ -265,7 +269,7 @@ void bt_connection_changed(esp_a2d_connection_state_t state, void *ptr) {
             track.peer_until = millis() + PEER_SHOW_MS + 2000;
             xSemaphoreGive(track_mutex);
         }
-        connect_event = true;
+        xTaskNotifyFromISR(core0_task_handle, NOTIFY_CONNECT, eSetBits, NULL);
     } else if (was_connected) {
         if (xSemaphoreTake(track_mutex, pdMS_TO_TICKS(100))) {
             memset(track.title,     0, sizeof(track.title));
@@ -276,20 +280,23 @@ void bt_connection_changed(esp_a2d_connection_state_t state, void *ptr) {
             track.playing     = false;
             xSemaphoreGive(track_mutex);
         }
-        disconnect_event = true;
+        xTaskNotifyFromISR(core0_task_handle, NOTIFY_DISCONNECT, eSetBits, NULL);
     }
 }
 
 void core_0_loop(void *param) {
+    core0_task_handle = xTaskGetCurrentTaskHandle();
+    uint32_t notif = 0;
+
     for (;;) {
+        xTaskNotifyWait(0, ULONG_MAX, &notif, pdMS_TO_TICKS(10));
+
         // --- BT shutdown ---
-        if (bt_shutdown_pending) {
+        if (notif & NOTIFY_BT_SHUTDOWN) {
             auto_reconnect_enabled = false;
             peer_loaded     = false;
             reconnect_count = 0;
             blink_count     = 0;
-            bt_shutdown_pending = false;
-
             Serial.printf("[SHUTDOWN] before end | Heap: %u\n", ESP.getFreeHeap());
             a2dp_sink.end(false);
             bt_ready = false;
@@ -297,19 +304,14 @@ void core_0_loop(void *param) {
         }
 
         // --- Start ADC ---
-        if (start_adc_pending) {
-            start_adc_pending = false;
-
-            // start line ADC
+        if (notif & NOTIFY_START_ADC) {
             if (chime_blocking) Serial.println("Start ADC blocked by chime busy. waiting");
             while(chime_blocking) vTaskDelay(10);
             Serial.println("Stopping I2S");
             i2s.end();
-
             gpio_reset_pin((gpio_num_t)DAC_BCK);
             gpio_reset_pin((gpio_num_t)DAC_DATA);
             gpio_reset_pin((gpio_num_t)DAC_WS);
-
             Serial.println("Starting ADC");
             i2s_config_t i2s_cfg = {
                 .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN),
@@ -327,7 +329,6 @@ void core_0_loop(void *param) {
             adc1_config_width(ADC_WIDTH_BIT_12);
             adc1_config_channel_atten(ADC_CHANNEL, ADC_ATTEN_DB_12);
             i2s_adc_enable(ADC_I2S_PORT);
-
             xSemaphoreTake(audio_mutex, portMAX_DELAY);
             memset(audio_ring, 0, sizeof(audio_ring));
             audio_ring_pos = 0;
@@ -336,47 +337,41 @@ void core_0_loop(void *param) {
             line_audio_active = true;
         }
 
+        // --- Stop ADC ---
+        if (notif & NOTIFY_STOP_ADC) {
+            line_audio_active = false;
+            i2s_adc_disable(ADC_I2S_PORT);
+            i2s_driver_uninstall(ADC_I2S_PORT);
+            xSemaphoreTake(audio_mutex, portMAX_DELAY);
+            memset(audio_ring, 0, sizeof(audio_ring));
+            audio_ring_pos = 0;
+            xSemaphoreGive(audio_mutex);
+            xSemaphoreGive(adc_stop_sem); // signal handle_mode_switching
+        }
+
         // --- Line ADC read ---
         if (line_audio_active) {
-            if (stop_adc_pending) {
-                stop_adc_pending = false;
-                line_audio_active = false;
-                i2s_adc_disable(ADC_I2S_PORT);
-                i2s_driver_uninstall(ADC_I2S_PORT);
-                xSemaphoreTake(audio_mutex, portMAX_DELAY);
-                memset(audio_ring, 0, sizeof(audio_ring));
-                audio_ring_pos = 0;
-                xSemaphoreGive(audio_mutex);
-                adc_stopped = true; // signal loop() it's safe to proceed
-                continue;
-            }
-            // if (!line_audio_muted) {
-                size_t bytes_read = 0;
-                i2s_read(ADC_I2S_PORT, adc_buf, sizeof(adc_buf), &bytes_read, pdMS_TO_TICKS(10));
-                if (xSemaphoreTake(audio_mutex, 0)) {
-                    for (int i = 0; i < (int)(bytes_read / 2); i++) {
-                        int16_t raw = ((int16_t)(adc_buf[i] & 0x0FFF) - 2048) << 4;
-                        adc_dc_avg += (raw - adc_dc_avg) >> 7;
-                        int16_t dc_removed = raw - (int16_t)adc_dc_avg;
-
-                        // low-pass anti-alias
-                        int16_t filtered = (int16_t)(0.4f * dc_removed + 0.6f * lp_prev);
-                        lp_prev = filtered;
-
-                        int32_t val = (int32_t)filtered * 3 / 2; // gain boost
-                        val = val > INT16_MAX ? INT16_MAX : (val < INT16_MIN ? INT16_MIN : val);
-                        audio_ring[audio_ring_pos % AUDIO_BUF_LEN] = (int16_t)val;
-                        audio_ring_pos++;
-                    }
-                    xSemaphoreGive(audio_mutex);
+            size_t bytes_read = 0;
+            i2s_read(ADC_I2S_PORT, adc_buf, sizeof(adc_buf), &bytes_read, pdMS_TO_TICKS(5));
+            if (xSemaphoreTake(audio_mutex, 0)) {
+                for (int i = 0; i < (int)(bytes_read / 2); i++) {
+                    int16_t raw = ((int16_t)(adc_buf[i] & 0x0FFF) - 2048) << 4;
+                    adc_dc_avg += (raw - adc_dc_avg) >> 7;
+                    int16_t dc_removed = raw - (int16_t)adc_dc_avg;
+                    int16_t filtered = (int16_t)(0.4f * dc_removed + 0.6f * lp_prev);
+                    lp_prev = filtered;
+                    int32_t val = (int32_t)filtered * 3 / 2;
+                    val = val > INT16_MAX ? INT16_MAX : (val < INT16_MIN ? INT16_MIN : val);
+                    audio_ring[audio_ring_pos % AUDIO_BUF_LEN] = (int16_t)val;
+                    audio_ring_pos++;
                 }
-            // }
-            continue; // skip BT event handling while in line mode
+                xSemaphoreGive(audio_mutex);
+            }
+            continue;
         }
 
         // --- Disconnect event ---
-        if (disconnect_event) {
-            disconnect_event = false;
+        if (notif & NOTIFY_DISCONNECT) {
             peer_loaded     = false;
             auto_reconnect_enabled = false;
             reconnect_count = 0;
@@ -386,13 +381,11 @@ void core_0_loop(void *param) {
 
         // --- LED and auto reconnect ---
         if (bt_ready && !bt_connected) {
-            // load peer once
             if (!peer_loaded) {
                 peer_loaded = bt_load_peer(saved_peer);
                 reconnect_count = 0;
                 blink_count = 0;
             }
-            // attempt reconnect once per 3 blink cycles (every ~3s)
             if (peer_loaded && auto_reconnect_enabled && reconnect_count < 5 && !bt_connected) {
                 if (blink_count % 4 == 0) {
                     Serial.printf("[RECONNECT] Attempt: %d\n", ++reconnect_count);
@@ -401,19 +394,21 @@ void core_0_loop(void *param) {
                 blink_count++;
             }
 
-            digitalWrite(PIN_LED, HIGH);
-            vTaskDelay(pdMS_TO_TICKS(500));
-            if (!bt_connected) digitalWrite(PIN_LED, LOW);
-            vTaskDelay(pdMS_TO_TICKS(500));
+            static uint32_t led_last = 0;
+            static bool led_state = false;
+            if (millis() - led_last >= 500) {
+                led_last = millis();
+                led_state = !led_state;
+                digitalWrite(PIN_LED, led_state ? HIGH : LOW);
+            }
             continue;
         }
 
         // --- BT ready wait ---
-        if (!bt_ready) { vTaskDelay(10); continue; }
+        if (!bt_ready) continue;
 
         // --- Connect event ---
-        if (connect_event) {
-            connect_event = false;
+        if (notif & NOTIFY_CONNECT) {
             enqueue_chime("/connect.mp3");
             vTaskDelay(pdMS_TO_TICKS(500));
             const char *pname = a2dp_sink.get_peer_name();
@@ -424,8 +419,6 @@ void core_0_loop(void *param) {
             esp_bd_addr_t *addr = a2dp_sink.get_current_peer_address();
             if (addr) bt_save_peer(*addr);
         }
-
-        vTaskDelay(2);
     }
 }
 
@@ -447,11 +440,31 @@ void drawScrollUTF8(const char *text, int y, uint32_t scroll_start, int tw) {
         u8g2.drawUTF8(0, y, text);
         return;
     }
-    float elapsed = (millis() - scroll_start) / 1000.0f;
-    int   period  = tw + SCROLL_GAP;
-    int   offset  = (int)(elapsed * SCROLL_SPEED) % period;
-    u8g2.drawUTF8(-offset,          y, text);
-    u8g2.drawUTF8(-offset + period, y, text);
+    uint32_t elapsed_ms = millis() - scroll_start;
+    
+    // pause at start
+    if (elapsed_ms < SCROLL_PAUSE_MS) {
+        u8g2.drawUTF8(0, y, text);
+        return;
+    }
+
+    uint32_t t_scroll = elapsed_ms - SCROLL_PAUSE_MS;
+    int period = tw + SCROLL_GAP;
+    // time needed to scroll one full period (in milliseconds)
+    uint32_t scroll_duration_ms = (period * 1000) / SCROLL_SPEED;
+    // one cycle = scroll + pause
+    uint32_t cycle_time = scroll_duration_ms + SCROLL_PAUSE_MS;
+    uint32_t time_in_cycle = t_scroll % cycle_time;
+
+    if (time_in_cycle < scroll_duration_ms) {
+        // scrolling phase – offset goes from 0 to period-1
+        uint32_t offset = (time_in_cycle * SCROLL_SPEED) / 1000;
+        u8g2.drawUTF8(-(int)offset,          y, text);
+        u8g2.drawUTF8(-(int)offset + period, y, text);
+    } else {
+        // pause phase – text stays at the left edge
+        u8g2.drawUTF8(0, y, text);
+    }
 }
 
 void draw_fft() {
@@ -752,8 +765,8 @@ void handle_buttons() {
             save_state();
             if (input_mode == MODE_BT) {
                 if (bt_connected) enqueue_chime("/disconnect.mp3");
-                bt_shutdown_pending = true;
-                while (bt_ready) vTaskDelay(10);
+                xTaskNotify(core0_task_handle, NOTIFY_BT_SHUTDOWN, eSetBits);
+                while (bt_ready) vTaskDelay(10); // bt_ready still volatile, keep this
                 xQueueReset(chime_queue);
                 input_mode = MODE_LINE;
             } else if (input_mode == MODE_LINE) {
@@ -815,13 +828,13 @@ void handle_buttons() {
 
 void handle_mode_switching() {
     if (!mode_switching) return;
+    if (!core0_task_handle) return;
     mode_switching = false;
     if (input_mode == MODE_BT) {
         auto_reconnect_enabled = true;
-        stop_adc_pending = true;
+        xTaskNotify(core0_task_handle, NOTIFY_STOP_ADC, eSetBits);
+        xSemaphoreTake(adc_stop_sem, portMAX_DELAY); // replaces while(!adc_stopped)
         Serial.println("Starting BT Mode");
-        while (!adc_stopped) vTaskDelay(10); // wait for core 0 to cleanly stop ADC
-        adc_stopped = false;
         digitalWrite(PIN_LINE_MODE, LOW);
 
         gif_open("/connecting.raw", 11, 8);
@@ -858,8 +871,7 @@ void handle_mode_switching() {
     }
 
     else if (input_mode == MODE_LINE) {
-        start_adc_pending = true;
-        stop_adc_pending = false;
+        xTaskNotify(core0_task_handle, NOTIFY_START_ADC, eSetBits);
         line_audio_muted = false;
         Serial.println("Starting Line Mode");
         gif_open("/line_in.raw", 2, 2);
@@ -906,6 +918,7 @@ void setup() {
 
     track_mutex = xSemaphoreCreateMutex();
     audio_mutex = xSemaphoreCreateMutex();
+    adc_stop_sem = xSemaphoreCreateBinary();
     chime_queue = xQueueCreate(1, sizeof(const char *));
 
     xTaskCreatePinnedToCore(chime_task,   "chime",   3072, NULL, 1, NULL, 1);
